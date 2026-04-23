@@ -7631,6 +7631,155 @@ def render_pulse_tab():
             unsafe_allow_html=True,
         )
 
+    # ── Phase 6 — Smart Money Wallet Tracker (whale_tracker.py) ─────────────
+    wt = result.get("whale_signal") or {}
+    wt_data  = wt.get("data", {}) or {}
+    wt_color = wt.get("color", "#8892b0")
+    wt_label = wt.get("label", "N/A")
+    wt_score = wt.get("score", 0)
+    wt_ok    = wt.get("ok", False)
+    wt_supp  = wt.get("supported", False)
+
+    if wt_ok and wt_supp:
+        _sign = "+" if wt_score > 0 else ""
+        _score_html = f'<span style="color:{wt_color};font-size:13px;font-weight:800;">{_sign}{wt_score}</span>'
+
+        # Header card
+        st.markdown(
+            f'<div style="background:#161b22;border:1px solid #21262d;border-radius:8px;'
+            f'padding:14px 16px;margin-top:8px;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+            f'<div style="color:{wt_color};font-size:11px;text-transform:uppercase;'
+            f'letter-spacing:1px;font-weight:700;">🔬 Phase 6 — Smart Money Wallet Tracker</div>'
+            f'<div>'
+            f'<span style="color:#3fb950;border:1px solid #3fb950;'
+            f'padding:1px 8px;border-radius:4px;font-size:10px;margin-right:6px;">PHASE 6 — LIVE</span>'
+            f'<span style="color:{wt_color};border:1px solid {wt_color};'
+            f'padding:1px 8px;border-radius:4px;font-size:10px;">{wt_label} &nbsp;{_score_html}</span>'
+            f'</div></div>'
+            f'<div style="color:#ccd6f6;font-size:11px;margin-bottom:10px;line-height:1.6;">'
+            f'{wt.get("detail","")}'
+            f'</div>'
+            f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;">'
+            f'<div><div style="color:#8892b0;font-size:10px;">Smart Wallets Found</div>'
+            f'<div style="color:#ccd6f6;font-size:13px;font-weight:700;">{wt_data.get("total_whales", 0)}</div></div>'
+            f'<div><div style="color:#3fb950;font-size:10px;">🟢 Accumulating</div>'
+            f'<div style="color:#3fb950;font-size:13px;font-weight:700;">{wt_data.get("n_whales_buy", 0)}</div></div>'
+            f'<div><div style="color:#f85149;font-size:10px;">🔴 Distributing</div>'
+            f'<div style="color:#f85149;font-size:13px;font-weight:700;">{wt_data.get("n_whales_sell", 0)}</div></div>'
+            f'<div><div style="color:#8892b0;font-size:10px;">Holding / Inactive</div>'
+            f'<div style="color:#ccd6f6;font-size:13px;font-weight:700;">{wt_data.get("n_whales_hold", 0)}</div></div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Avg win rate bar
+        avg_wr = wt_data.get("avg_win_rate", 0)
+        if avg_wr > 0:
+            wr_color = "#3fb950" if avg_wr >= 60 else "#e3b341" if avg_wr >= 50 else "#f85149"
+            st.markdown(
+                f'<div style="margin-top:10px;padding-top:10px;border-top:1px solid #21262d;">'
+                f'<div style="color:#8892b0;font-size:10px;margin-bottom:4px;">AVG SMART-MONEY WIN RATE</div>'
+                f'<div style="display:flex;align-items:center;gap:10px;">'
+                f'<div style="flex:1;background:#21262d;border-radius:4px;height:6px;">'
+                f'<div style="width:{min(avg_wr,100):.0f}%;background:{wr_color};height:6px;border-radius:4px;"></div>'
+                f'</div>'
+                f'<div style="color:{wr_color};font-size:13px;font-weight:700;min-width:40px;">{avg_wr:.0f}%</div>'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+
+        # Wallet table — top smart money wallets with action badges
+        wallets = wt_data.get("wallets", [])
+        if wallets:
+            action_colors = {"BUY": "#3fb950", "SELL": "#f85149", "HOLD": "#8892b0", "UNKNOWN": "#484f58"}
+            action_icons  = {"BUY": "▲ BUY", "SELL": "▼ SELL", "HOLD": "● HOLD", "UNKNOWN": "? —"}
+
+            rows_html = ""
+            for w in wallets:
+                act = w.get("action", "HOLD")
+                ac  = action_colors.get(act, "#8892b0")
+                ai  = action_icons.get(act, act)
+                rows_html += (
+                    f'<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr;'
+                    f'gap:4px;padding:5px 6px;border-bottom:1px solid #1a1f2e;font-size:11px;">'
+                    f'<div style="color:#ccd6f6;font-family:monospace;">{w.get("address_short","")}</div>'
+                    f'<div style="color:#e3b341;text-align:right;font-weight:700;">{w.get("win_rate",0):.0f}%</div>'
+                    f'<div style="color:#8892b0;text-align:right;">{w.get("n_trades",0)} trades</div>'
+                    f'<div style="color:{ac};text-align:right;font-weight:700;">{ai}</div>'
+                    f'</div>'
+                )
+
+            st.markdown(
+                f'<div style="margin-top:10px;border:1px solid #21262d;border-radius:6px;overflow:hidden;">'
+                f'<div style="background:#161b22;display:grid;grid-template-columns:2fr 1fr 1fr 1fr;'
+                f'gap:4px;padding:5px 6px;border-bottom:1px solid #30363d;">'
+                f'<div style="color:#8892b0;font-size:10px;text-transform:uppercase;">Wallet</div>'
+                f'<div style="color:#8892b0;font-size:10px;text-align:right;">Win Rate</div>'
+                f'<div style="color:#8892b0;font-size:10px;text-align:right;">Trades</div>'
+                f'<div style="color:#8892b0;font-size:10px;text-align:right;">7d Action</div>'
+                f'</div>'
+                f'{rows_html}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        # DB stats footer + refresh button
+        try:
+            import whale_tracker as _wt_mod
+            db_stats = _wt_mod.get_db_stats()
+            st.markdown(
+                f'<div style="color:#484f58;font-size:10px;margin-top:8px;padding-top:8px;'
+                f'border-top:1px solid #21262d;font-style:italic;">'
+                f'📊 DB: {db_stats["total_wallets_scanned"]} wallets scanned · '
+                f'{db_stats["smart_money_wallets"]} smart money identified · '
+                f'{db_stats["tokens_with_signals"]} tokens tracked'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            if st.button("🔄 Refresh Whale Signal Cache", key="wt_refresh_btn"):
+                _wt_mod.clear_signal_cache()
+                st.success("Cache cleared — whale signal will re-fetch on next analysis.")
+        except ImportError:
+            pass
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    elif wt_supp and not wt_ok:
+        # Supported token but fetch failed
+        st.markdown(
+            f'<div style="background:#0d1117;border:1px dashed #30363d;border-radius:8px;'
+            f'padding:10px 14px;margin-top:8px;opacity:0.75;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+            f'<div style="color:#8892b0;font-size:11px;text-transform:uppercase;'
+            f'letter-spacing:1px;font-weight:700;">🔬 Phase 6 — Smart Money Wallet Tracker</div>'
+            f'<span style="color:#e3b341;border:1px solid #e3b341;'
+            f'padding:1px 8px;border-radius:4px;font-size:10px;">{wt_label}</span>'
+            f'</div>'
+            f'<div style="color:#8892b0;font-size:11px;margin-top:4px;">'
+            f'{wt.get("detail","No data returned — check Etherscan rate limits or add a free API key.")}'
+            f'</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    elif not wt_supp:
+        # Token not in contract map
+        st.markdown(
+            f'<div style="background:#0d1117;border:1px dashed #30363d;border-radius:8px;'
+            f'padding:10px 14px;margin-top:8px;opacity:0.6;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+            f'<div style="color:#484f58;font-size:11px;text-transform:uppercase;'
+            f'letter-spacing:1px;font-weight:700;">🔬 Phase 6 — Smart Money Wallet Tracker</div>'
+            f'<span style="color:#484f58;border:1px solid #484f58;'
+            f'padding:1px 8px;border-radius:4px;font-size:10px;">NOT MAPPED</span>'
+            f'</div>'
+            f'<div style="color:#484f58;font-size:11px;margin-top:4px;">'
+            f'{wt.get("detail", "Token not in the ERC-20 contract map. Add its contract address to whale_tracker.py to enable Phase 6.")}'
+            f'</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
 
 def _render_enhanced_trade_plan_html(sig: dict) -> str:
     """

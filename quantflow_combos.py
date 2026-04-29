@@ -946,131 +946,6 @@ COMBOS_BY_NAME = {c["name"]: c for c in COMBOS}
 
 
 # ============================================================================
-# CONFIDENCE LEVELS — strict / relaxed / loose match support (Apr 29, 2026)
-# ============================================================================
-# Each combo's STRICT criteria is the empirically-validated band from the audit.
-# But strict criteria are tight, and many candidate signals fail one criterion
-# by a hair (e.g. body 0.69 vs combo's 0.70 floor; vol 1.99 vs 2.00). Strict
-# mode produced near-zero setups for 3 days running in late Apr 2026, which is
-# what motivated this loose-match layer.
-#
-# DESIGN PRINCIPLE
-# ─────────────────
-# The audit identified specific DEAD ZONES that cannot be entered without
-# destroying edge — these stay as hard caps regardless of confidence level:
-#   * body 0.60-0.70 universally weak for trend-following (Finding 4) → never enter
-#   * ADX > 50 universally weak (Finding 2) → hard cap at 50
-#   * countertrend needs body >= 0.78 (below = no exhaustion edge per Finding 5)
-#   * vol < 1.20 = no momentum signal at all
-#   * ADX < 25 = no trend at all
-#
-# Within those caps, RELAXED widens the bands a little, LOOSE widens more.
-# Body widening for trend-following is ASYMMETRIC: combos that sit below the
-# dead zone (e.g. C1A 0.5-0.6) only widen DOWNWARD; combos above it (e.g. C6A
-# 0.7-0.8) only widen UPWARD. Neither type is allowed to spill into 0.6-0.7.
-#
-# EXPECTED EDGE HAIRCUT (from boundary-noise reasoning, not separately audited)
-# ─────────────────────
-#   STRICT  → 100% of audit PF (full size, the "ideal" trade)
-#   RELAXED → ~92% of audit PF (3/4 size; some boundary-jitter setups included)
-#   LOOSE   → ~80% of audit PF (1/2 size; clearly outside the audit band but
-#              still inside the safe regions)
-#
-# IMPORTANT: these haircuts are estimates, not measured. After 30+ live trades
-# at each level we should re-fit the haircuts from the trade journal.
-# ============================================================================
-
-LEVELS = ("STRICT", "RELAXED", "LOOSE")  # ordered strictest first
-
-LEVEL_SETTINGS = {
-    "STRICT": {
-        "body_pad": 0.00, "vol_pad_min": 0.00, "vol_pad_max": 0.00,
-        "adx_pad": 0,    "size_factor": 1.00, "pf_haircut": 1.00,
-    },
-    "RELAXED": {
-        "body_pad": 0.03, "vol_pad_min": 0.15, "vol_pad_max": 0.50,
-        "adx_pad": 2,    "size_factor": 0.75, "pf_haircut": 0.92,
-    },
-    "LOOSE": {
-        "body_pad": 0.05, "vol_pad_min": 0.30, "vol_pad_max": 1.00,
-        "adx_pad": 3,    "size_factor": 0.50, "pf_haircut": 0.80,
-    },
-}
-
-# Hard floors / caps that cannot be crossed regardless of level
-_BODY_DEAD_ZONE_MIN = 0.60   # trend: body 0.60-0.70 is the universal dead zone
-_BODY_DEAD_ZONE_MAX = 0.70
-_BODY_FLOOR_TREND   = 0.40   # absolute minimum for trend (below = noise)
-_BODY_FLOOR_CT      = 0.78   # countertrend needs strong candles
-_BODY_CEIL          = 1.01   # 1.01 (not 1.00) so widened bands never narrow the
-                              # CT4/CT6 strict band (body_max=1.01 by convention,
-                              # so the half-open interval [min, max) includes 1.00)
-_VOL_FLOOR          = 1.20   # below this, no momentum signal
-_ADX_FLOOR          = 25.0   # below this, no trend at all
-_ADX_CEIL           = 50.0   # ABOVE this universally fails (Finding 2)
-
-
-def _widen_criteria(combo: dict, level: str) -> dict:
-    """
-    Return a copy of `combo["criteria"]` with bounds widened per the given
-    confidence level, respecting all audit-known dead zones and hard caps.
-
-    Body widening is asymmetric per combo type:
-      - trend with body_max <= 0.60 (e.g. C1A 0.5-0.6): widen DOWN only.
-        body_max is clamped at 0.60 so the band never enters the dead zone.
-      - trend with body_min >= 0.70 (e.g. C6A 0.7-0.8): widen UP only.
-        body_min is clamped at 0.70 so the band never enters the dead zone.
-      - countertrend (body 0.80-1.00): widens up to ceil 1.00, down to floor 0.78.
-
-    Volume widens symmetrically with floor 1.20.
-    ADX widens symmetrically (trend only) with floor 25 / ceil 50.
-    """
-    crit = dict(combo["criteria"])
-    if level == "STRICT":
-        return crit
-
-    s = LEVEL_SETTINGS[level]
-    combo_type = combo.get("combo_type", "trend_following")
-    body_min_o = float(crit["body_min"])
-    body_max_o = float(crit["body_max"])
-    vol_min_o  = float(crit["vol_min"])
-    vol_max_o  = float(crit["vol_max"])
-
-    # Body widening — asymmetric to protect the 0.60-0.70 dead zone for trend
-    if combo_type == "trend_following":
-        if body_max_o <= _BODY_DEAD_ZONE_MIN + 1e-9:
-            # Combo sits BELOW the dead zone (e.g. 0.5-0.6) — widen DOWN only.
-            crit["body_min"] = max(_BODY_FLOOR_TREND, body_min_o - s["body_pad"])
-            crit["body_max"] = min(body_max_o, _BODY_DEAD_ZONE_MIN)
-        elif body_min_o >= _BODY_DEAD_ZONE_MAX - 1e-9:
-            # Combo sits ABOVE the dead zone (e.g. 0.7-0.8) — widen UP only.
-            crit["body_min"] = max(body_min_o, _BODY_DEAD_ZONE_MAX)
-            crit["body_max"] = min(_BODY_CEIL, body_max_o + s["body_pad"])
-        else:
-            # Combo straddles dead zone — shouldn't happen with current set.
-            # Widen carefully without making things worse. This branch exists
-            # so future combos don't silently fail; log-worthy but not fatal.
-            crit["body_min"] = max(_BODY_FLOOR_TREND, body_min_o - s["body_pad"])
-            crit["body_max"] = min(_BODY_CEIL, body_max_o + s["body_pad"])
-    else:
-        # Countertrend: respect 0.78 floor, can widen up to 1.00
-        crit["body_min"] = max(_BODY_FLOOR_CT, body_min_o - s["body_pad"])
-        crit["body_max"] = min(_BODY_CEIL,    body_max_o + s["body_pad"])
-
-    # Volume widening — symmetric, with floor
-    crit["vol_min"] = max(_VOL_FLOOR, vol_min_o - s["vol_pad_min"])
-    crit["vol_max"] = vol_max_o + s["vol_pad_max"]
-
-    # ADX widening — TREND ONLY. Countertrend leaves its (0, 999) wide range
-    # intact because it deliberately doesn't filter ADX (exhaustion zones).
-    if combo_type == "trend_following":
-        crit["adx_min"] = max(_ADX_FLOOR, float(crit["adx_min"]) - s["adx_pad"])
-        crit["adx_max"] = min(_ADX_CEIL,  float(crit["adx_max"]) + s["adx_pad"])
-
-    return crit
-
-
-# ============================================================================
 # CLASSIFIER — does a signal match a combo?
 # ============================================================================
 
@@ -1085,27 +960,32 @@ def _is_regime_aligned(direction: str, btc_regime: str) -> bool:
     return False
 
 
-def _signal_matches_at_level(sig: dict, combo: dict, btc_regime: str,
-                              level: str) -> bool:
+def signal_matches_combo(sig: dict, combo: dict, btc_regime: str = None) -> bool:
     """
-    Check whether a scanner signal matches a combo's criteria at a SPECIFIC
-    confidence level (STRICT/RELAXED/LOOSE). Internal helper for the level-walk
-    classifier — most callers should use `classify_signal_level` or
-    `signal_matches_combo` instead.
+    Check whether a scanner signal matches a combo's criteria.
 
-    Two combo types supported:
-      - "trend_following" (default Tier 1/2): scanner direction = trade direction.
-        Match when signal body/vol/adx fall in (level-widened) range and
-        scanner direction is in criteria.directions.
-      - "countertrend" (Tier 3): scanner direction is the SETUP direction
-        (e.g. LONG signal = bullish candle); the combo recommends the OPPOSITE
-        trade. Combo.criteria.signal_direction_required specifies the scanner
-        direction; combo.primary.direction is what to actually execute.
-        ADX is NOT filtered (criteria.adx_min/max are wide by design).
+    Inputs:
+      sig          a signal dict from _scanner_score_signal — must contain
+                   body_pct (signed), vol_mult, adx, direction, timeframe
+      combo        one entry from COMBOS
+      btc_regime   "BULL"/"BEAR"/"CHOP" — required for *-A combos. If None,
+                   *-A combos return False (cannot verify alignment).
 
-    Returns True only if all criteria pass at this level.
+    Two combo types are supported:
+      - "trend_following" (default for Tier 1/2): the scanner's direction IS
+        the trade direction. Combo matches when the signal's body/vol/adx fall
+        in range AND scanner direction is in `criteria.directions`.
+      - "countertrend"    (Tier 3): the scanner's direction is the SETUP
+        direction (i.e. scanner sees a bullish-momentum candle = LONG signal),
+        but the combo recommends the OPPOSITE trade. The combo's
+        `signal_direction_required` field specifies which scanner direction
+        triggers it; `trade_direction` is what to actually execute.
+        ADX is NOT a filter for countertrend (criteria.adx_min/max set wide).
+        Body and vol bands are tighter and based on momentum exhaustion.
+
+    Returns True only if all criteria pass.
     """
-    crit = _widen_criteria(combo, level)
+    crit = combo["criteria"]
     combo_type = combo.get("combo_type", "trend_following")
 
     # Timeframe must be in the eligible list (case-insensitive normalize)
@@ -1116,10 +996,10 @@ def _signal_matches_at_level(sig: dict, combo: dict, btc_regime: str,
     # Direction check differs by combo type
     sig_dir = sig.get("direction", "")
     if combo_type == "countertrend":
-        # Scanner direction MUST equal the combo's signal_direction_required.
-        # (For a "fade bullish exhaustion" combo, scanner must have emitted a
-        # LONG signal because that's how it labeled the bullish candle — the
-        # combo then prescribes the OPPOSITE trade.)
+        # Scanner direction MUST equal the combo's signal_direction_required
+        # (i.e. for a "fade bullish exhaustion" combo, scanner must have
+        # emitted a LONG signal because that's how it labeled the bullish
+        # candle — we then take the OPPOSITE trade).
         if sig_dir != crit.get("signal_direction_required", ""):
             return False
     else:
@@ -1137,80 +1017,31 @@ def _signal_matches_at_level(sig: dict, combo: dict, btc_regime: str,
     if not (crit["vol_min"]  <= vol_mult   < crit["vol_max"]):   return False
     if not (crit["adx_min"]  <= adx        < crit["adx_max"]):   return False
 
-    # Regime check for *-A combos (only trend-following uses regime_mode "A").
-    # We do NOT widen the regime rule with level — alignment is structural.
+    # Regime check for *-A combos (only trend-following uses regime_mode "A")
     if crit["regime_mode"] == "A":
         if btc_regime is None: return False
         if not _is_regime_aligned(sig["direction"], btc_regime): return False
     return True
 
 
-def signal_matches_combo(sig: dict, combo: dict, btc_regime: str = None) -> bool:
-    """
-    Strict-only match check (backward-compatible bool API).
-    For level-aware matching use `classify_signal_level` instead.
-    """
-    return _signal_matches_at_level(sig, combo, btc_regime, "STRICT")
-
-
-def classify_signal_level(sig: dict, combo: dict, btc_regime: str = None,
-                           allowed_levels: tuple = ("STRICT",)) -> Optional[str]:
-    """
-    Walk the levels strictest first and return the first level in `allowed_levels`
-    at which the signal matches the combo. Returns None if no allowed level matches.
-
-    The strictest-first walk is important: a signal that matches at STRICT will
-    always also match at RELAXED and LOOSE, but we want it tagged STRICT (highest
-    confidence, full sizing).
-
-    Default allowed_levels=("STRICT",) preserves backward compatibility.
-    """
-    for lvl in LEVELS:
-        if lvl not in allowed_levels:
-            continue
-        if _signal_matches_at_level(sig, combo, btc_regime, lvl):
-            return lvl
-    return None
-
-
 def get_matching_combos(sig: dict, enabled_combos: list[str],
                         btc_regime: str = None,
-                        allowed_levels: tuple = ("STRICT",)) -> list[dict]:
+                        allowed_levels=None) -> list[dict]:
     """
-    Return the list of combos this signal matches, restricted to combos in
-    `enabled_combos` (the user's checkbox selection) and to the confidence
-    levels in `allowed_levels`.
+    Return the list of combos this signal matches, restricted to combos
+    in `enabled_combos` (the user's checkbox selection).
+    Sorted by tier (lowest tier first = highest PF first).
 
-    Each returned dict is a SHALLOW COPY of the combo with three extra fields:
-      - "_matched_level": "STRICT" / "RELAXED" / "LOOSE" — strictest match
-      - "_size_factor":   1.00 / 0.75 / 0.50 — multiplier on combo.primary.sizing
-      - "_pf_haircut":    1.00 / 0.92 / 0.80 — expected PF degradation estimate
-
-    Sorted by (tier ascending = highest audit PF first). When two combos match
-    at different levels, the strictest one always sorts higher because tier
-    breaks ties before level effects compound — STRICT-Tier-1 will always
-    appear above LOOSE-Tier-1, and Tier 1 always above Tier 2.
-
-    Default allowed_levels=("STRICT",) preserves the prior behavior exactly.
+    `allowed_levels` (bar-offset age filter) is accepted for API compatibility
+    but is intentionally unused here — age filtering is applied to the signal
+    list before this function is called, so it has no effect on combo matching.
     """
     matches = []
     for combo in COMBOS:
-        if combo["name"] not in enabled_combos:
-            continue
-        lvl = classify_signal_level(sig, combo, btc_regime, allowed_levels)
-        if lvl is None:
-            continue
-        # Shallow copy with match metadata. Don't mutate the COMBOS source.
-        mc = dict(combo)
-        mc["_matched_level"] = lvl
-        mc["_size_factor"]   = LEVEL_SETTINGS[lvl]["size_factor"]
-        mc["_pf_haircut"]    = LEVEL_SETTINGS[lvl]["pf_haircut"]
-        matches.append(mc)
-    # Primary sort: tier asc (highest PF first).
-    # Secondary sort: level (STRICT before RELAXED before LOOSE) — within the
-    # same tier, prefer the strictest-matching combo.
-    _level_rank = {"STRICT": 0, "RELAXED": 1, "LOOSE": 2}
-    matches.sort(key=lambda c: (c["tier"], _level_rank.get(c.get("_matched_level"), 9)))
+        if combo["name"] not in enabled_combos: continue
+        if signal_matches_combo(sig, combo, btc_regime=btc_regime):
+            matches.append(combo)
+    matches.sort(key=lambda c: c["tier"])
     return matches
 
 
@@ -1241,39 +1072,6 @@ def _sizing_badge_html(sizing: str) -> str:
         f'padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;'
         f'letter-spacing:0.5px;">{sizing} · {sizing_pct} risk</span>'
     )
-
-
-def _level_badge_html(level: str) -> str:
-    """
-    Confidence-level badge (STRICT/RELAXED/LOOSE) — shown next to the combo
-    name in scanner cards. Color-coded so the trader can spot loose-mode matches
-    at a glance and treat them with appropriate caution.
-    """
-    if level == "STRICT":
-        bg, fg = "#1a4731", "#34d399"   # green — full confidence
-        title  = ("Audit-validated criteria — full sizing, expected PF "
-                  "matches the combo's stated rollup PF")
-    elif level == "RELAXED":
-        bg, fg = "#3f3a16", "#fbbf24"   # yellow — moderate confidence
-        title  = ("Slightly widened criteria (boundary jitter) — sizing 75% "
-                  "of stated, expected PF ~92% of stated rollup PF")
-    elif level == "LOOSE":
-        bg, fg = "#3f1d1d", "#fb923c"   # orange — exploratory
-        title  = ("Wider criteria (clearly outside audit band but inside "
-                  "safe regions) — sizing 50% of stated, expected PF ~80% "
-                  "of stated rollup PF. Use sparingly, paper-trade first.")
-    else:
-        bg, fg = "#22272e", "#ccd6f6"
-        title  = ""
-    return (f'<span title="{title}" style="display:inline-block;'
-            f'background:{bg};color:{fg};padding:2px 8px;border-radius:10px;'
-            f'font-size:11px;font-weight:700;letter-spacing:0.5px;">{level}</span>')
-
-
-def _effective_size_pct(sizing: str, size_factor: float) -> float:
-    """Effective % risk after applying level size_factor to base sizing."""
-    base_pct = {"LARGE": 0.75, "FULL": 0.50, "HALF": 0.25, "SMALL": 0.15}.get(sizing, 0.50)
-    return base_pct * float(size_factor)
 
 
 def render_combo_panel_html(matches: list[dict], sig: dict) -> str:
@@ -1320,38 +1118,6 @@ def render_combo_panel_html(matches: list[dict], sig: dict) -> str:
         )
 
     sizing_html = _sizing_badge_html(pp["sizing"])
-
-    # ── Confidence-level badge + effective-sizing/PF note ─────────────────
-    # When the match level is RELAXED or LOOSE, we show:
-    #   1. A colored level badge next to the sizing badge
-    #   2. A note showing the EFFECTIVE risk % (sizing × size_factor) and the
-    #      EXPECTED PF after the haircut (so the trader doesn't size as if the
-    #      audit PF still applies)
-    # For STRICT matches we still show the badge (green = full confidence) so
-    # the user sees the level system is working, but skip the effective-note.
-    matched_level = p.get("_matched_level", "STRICT")
-    size_factor   = float(p.get("_size_factor", 1.0))
-    pf_haircut    = float(p.get("_pf_haircut", 1.0))
-    level_html    = _level_badge_html(matched_level)
-    if matched_level != "STRICT":
-        eff_pct       = _effective_size_pct(pp["sizing"], size_factor)
-        expected_pf   = float(p["rollup"]["pf"]) * pf_haircut
-        # Tone color matches the level badge background severity
-        tone_color    = "#fbbf24" if matched_level == "RELAXED" else "#fb923c"
-        effective_note_html = (
-            f'<div style="margin-top:6px;padding:6px 10px;'
-            f'background:rgba(251,146,60,0.08);'
-            f'border-left:3px solid {tone_color};border-radius:4px;'
-            f'font-size:11px;color:#ccd6f6;">'
-            f'<b style="color:{tone_color};">⚙ {matched_level} match:</b> '
-            f'effective risk <b>{eff_pct:.2f}%</b> '
-            f'(sizing {pp["sizing"]} × {size_factor:.2f}) · '
-            f'expected PF <b>~{expected_pf:.2f}</b> '
-            f'(audit {p["rollup"]["pf"]:.2f} × {pf_haircut:.2f})'
-            f'</div>'
-        )
-    else:
-        effective_note_html = ""
 
     # Direction-specific stats for this signal's tf+direction.
     # Countertrend combos don't have by_direction_* breakdowns — they're
@@ -1416,41 +1182,20 @@ def render_combo_panel_html(matches: list[dict], sig: dict) -> str:
         f'</div>'
     )
 
-    # Overlap section — defensive: handles both trend and countertrend combos
-    # in overlap (rare but possible when body~0.78-0.80 + vol~5x where bands kiss).
+    # Overlap section
     overlap_html = ""
     if overlap:
         items = []
         for o in overlap:
             op = o["primary"]
-            o_is_ct = (o.get("combo_type") == "countertrend")
-            o_level = o.get("_matched_level", "STRICT")
-            # Plan-match marker. Countertrend always shows 🔄 by construction.
-            if o_is_ct:
-                oo_marker = "🔄"
-            else:
-                oo_marker = "✅" if (sig_tf == op["tf"] and sig_dir == op["direction"]) else "↪"
-            # Plan summary string differs by combo type
-            if o_is_ct:
-                plan_str = (f"FADE → {op['tf']} {op['direction']} "
-                            f"retrace {op['entry_retrace']:+.2f} "
-                            f"{op['sl_method']} TP{op['tp_R']}R")
-            else:
-                plan_str = (f"{op['tf']} {op['direction']} "
-                            f"{op['entry_zone']} TP{op['tp_R']}R")
-            # Tiny inline level tag (compact form, no full badge styling)
-            level_tag = ""
-            if o_level != "STRICT":
-                tag_color = "#fbbf24" if o_level == "RELAXED" else "#fb923c"
-                level_tag = (f' <span style="color:{tag_color};font-weight:700;'
-                             f'font-size:10px;">[{o_level}]</span>')
+            oo_marker = "✅" if (sig_tf == op["tf"] and sig_dir == op["direction"]) else "↪"
             items.append(
                 f'<div style="margin-top:4px;font-size:11px;color:#8892b0;">'
-                f'{oo_marker} <b style="color:#a78bfa;">{o["name"]}</b>{level_tag} — '
+                f'{oo_marker} <b style="color:#a78bfa;">{o["name"]}</b> — '
                 f'rollup PF {o["rollup"]["pf"]:.2f}, '
                 f'mean R {o["rollup"]["mean_r"]:+.3f} '
-                f'<span style="opacity:0.7;">(primary plan: {plan_str}, '
-                f'mean {op["mean_r"]:+.3f})</span>'
+                f'<span style="opacity:0.7;">(primary plan: {op["tf"]} {op["direction"]} '
+                f'{op["entry_zone"]} TP{op["tp_R"]}R, mean {op["mean_r"]:+.3f})</span>'
                 f'</div>'
             )
         overlap_html = (
@@ -1493,13 +1238,12 @@ def render_combo_panel_html(matches: list[dict], sig: dict) -> str:
     panel = f"""
     <div style="margin:12px 0;padding:14px 16px;background:#161b22;
          border:2px solid {border_color};border-radius:8px;">
-        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap;">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
             <span style="font-size:18px;">{title_emoji}</span>
             <span style="color:{title_color};font-weight:800;font-size:14px;
                   letter-spacing:0.5px;">{title_text}</span>
             <span style="background:{badge_bg};color:#fff;padding:2px 8px;
                   border-radius:10px;font-size:11px;font-weight:700;">{p["name"]}</span>
-            {level_html}
             {sizing_html}
         </div>
         <div style="font-size:12px;color:#ccd6f6;margin-bottom:6px;">
@@ -1508,7 +1252,6 @@ def render_combo_panel_html(matches: list[dict], sig: dict) -> str:
             {adx_str}
             · regime {"ALIGNED" if p["criteria"]["regime_mode"]=="A" else "no filter"}
         </div>
-        {effective_note_html}
 
         <div style="background:#0d1f2d;border-radius:6px;padding:10px 12px;
              margin-top:8px;font-size:12px;color:#ccd6f6;">
@@ -1577,18 +1320,10 @@ def build_ai_prompt_block(matches: list[dict], sig: dict) -> str:
         crit = c["criteria"]
         c_type = c.get("combo_type", "trend_following")
         is_ct = (c_type == "countertrend")
-        # Match-level info — included so AI weighs conviction appropriately.
-        # STRICT = full audit conviction; RELAXED/LOOSE = boundary-jitter or
-        # outside-band; the size factor and PF haircut should affect verdict.
-        c_level = c.get("_matched_level", "STRICT")
-        c_size_factor = float(c.get("_size_factor", 1.0))
-        c_pf_haircut  = float(c.get("_pf_haircut", 1.0))
-        expected_pf = rollup["pf"] * c_pf_haircut
 
         prefix = "★ PRIMARY" if i == 1 else f"  ALSO #{i}"
         type_tag = " [COUNTERTREND]" if is_ct else ""
-        level_tag = "" if c_level == "STRICT" else f" [LEVEL: {c_level}]"
-        lines.append(f"{prefix}: {c['name']} (Tier {c['tier']}){type_tag}{level_tag}")
+        lines.append(f"{prefix}: {c['name']} (Tier {c['tier']}){type_tag}")
         # Criteria differs (no ADX in countertrend)
         if is_ct:
             lines.append(f"  Criteria: body {crit['body_min']:.2f}-{crit['body_max']:.2f}, "
@@ -1602,16 +1337,6 @@ def build_ai_prompt_block(matches: list[dict], sig: dict) -> str:
         lines.append(f"  Rollup: n={rollup['n']:,}, WR={rollup['wr']:.1f}%, "
                      f"mean R={rollup['mean_r']:+.3f}, "
                      f"Sharpe={rollup['sharpe']:+.2f}, PF={rollup['pf']:.2f}")
-        # Match-level note — only emitted when not STRICT, because STRICT is
-        # the default and adding noise to every prompt isn't useful.
-        if c_level != "STRICT":
-            lines.append(f"  ⚙ Match level: {c_level} — signal is OUTSIDE the strict "
-                         f"audit band (one or more criteria widened) but inside safe "
-                         f"regions. Recommended sizing is {c_size_factor:.2f}× of "
-                         f"stated; expected PF after haircut ≈ {expected_pf:.2f} "
-                         f"(audit {rollup['pf']:.2f} × {c_pf_haircut:.2f}). "
-                         f"Treat with appropriate caution and prefer STRICT matches "
-                         f"if multiple are available.")
         # Trade plan format differs
         if is_ct:
             setup_dir = "BULL" if cp["direction"] == "short" else "BEAR"

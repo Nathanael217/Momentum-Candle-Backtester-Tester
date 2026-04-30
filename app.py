@@ -29,24 +29,294 @@ except Exception as _e_qf:
     _QFCOMBOS_OK = False
     _qfcombos = None
 
-# Capability check: did the deployed quantflow_combos.py expose the level-aware
-# API (allowed_levels kwarg, classify_signal_level, LEVEL_SETTINGS)? This catches
-# the common deploy mistake where only app.py was re-uploaded but the combos
-# module is still the previous version. Without this guard the scanner crashes
-# with a cryptic TypeError far from the actual cause.
-_QFCOMBOS_HAS_LEVELS = False
-if _QFCOMBOS_OK:
+# ============================================================================
+# QUANTFLOW LEVEL SYSTEM — bundled in app.py for deploy robustness (May 2026)
+# ============================================================================
+# History: This used to live in quantflow_combos.py with a capability check in
+# app.py that fired "out of date" warnings if the modules drifted. The check
+# kept producing false positives (Streamlit Cloud .pyc cache staleness, partial
+# deploys, mixed file versions). The fix: bundle the entire level system here
+# so app.py is self-sufficient. quantflow_combos.py only needs to expose
+# `COMBOS` (list of dicts) and `COMBOS_BY_NAME` (dict) — those have been stable
+# since v3 and aren't going to change shape.
+#
+# This means: no version mismatch is possible. Whatever quantflow_combos.py is
+# deployed (even a stale cached one), as long as it has the COMBOS data, the
+# STRICT/RELAXED/LOOSE confidence-level system here in app.py works.
+#
+# Design notes (mirrored from the original spec):
+#   STRICT  → audit-validated, full sizing, expected PF = stated rollup PF
+#   RELAXED → small boundary widening (body ±0.03, vol ±0.15-0.50, ADX ±2)
+#             → 0.75× sizing, ~92% of stated PF
+#   LOOSE   → wider widening (body ±0.05, vol ±0.30-1.00, ADX ±3)
+#             → 0.50× sizing, ~80% of stated PF
+#
+# Hard caps (NEVER crossed regardless of level) protect known dead zones from
+# the audit:
+#   - body 0.60-0.70 trend dead zone (Finding 4) — never enter
+#   - body < 0.78 for countertrend (Finding 5) — never enter
+#   - ADX > 50 universally weak (Finding 2) — hard cap
+#   - vol < 1.20 — no momentum signal at all
+#   - ADX < 25 — no trend at all
+# ============================================================================
+
+_QF_LEVELS = ("STRICT", "RELAXED", "LOOSE")  # ordered strictest first
+
+_QF_LEVEL_SETTINGS = {
+    "STRICT": {
+        "body_pad": 0.00, "vol_pad_min": 0.00, "vol_pad_max": 0.00,
+        "adx_pad": 0,    "size_factor": 1.00, "pf_haircut": 1.00,
+    },
+    "RELAXED": {
+        "body_pad": 0.03, "vol_pad_min": 0.15, "vol_pad_max": 0.50,
+        "adx_pad": 2,    "size_factor": 0.75, "pf_haircut": 0.92,
+    },
+    "LOOSE": {
+        "body_pad": 0.05, "vol_pad_min": 0.30, "vol_pad_max": 1.00,
+        "adx_pad": 3,    "size_factor": 0.50, "pf_haircut": 0.80,
+    },
+}
+
+# Hard floors / caps — cannot be crossed regardless of level
+_QF_BODY_DEAD_ZONE_MIN = 0.60
+_QF_BODY_DEAD_ZONE_MAX = 0.70
+_QF_BODY_FLOOR_TREND   = 0.40
+_QF_BODY_FLOOR_CT      = 0.78
+_QF_BODY_CEIL          = 1.01   # 1.01 (not 1.00) preserves CT4/CT6 strict
+                                # band convention where body_max=1.01 includes
+                                # body=1.00 in the half-open interval [min, max)
+_QF_VOL_FLOOR          = 1.20
+_QF_ADX_FLOOR          = 25.0
+_QF_ADX_CEIL           = 50.0
+
+
+def _qf_widen_criteria(combo: dict, level: str) -> dict:
+    """
+    Return a copy of `combo["criteria"]` with bounds widened per the level,
+    respecting all audit-known dead zones and hard caps.
+
+    Body widening is asymmetric per combo type:
+      - trend with body_max <= 0.60 (e.g. C1A 0.5-0.6): widen DOWN only.
+      - trend with body_min >= 0.70 (e.g. C6A 0.7-0.8): widen UP only.
+      - countertrend (body 0.80-1.00): widens up to 1.00, down to 0.78.
+    Volume widens symmetrically with floor 1.20.
+    ADX widens symmetrically (trend only) with floor 25 / ceil 50.
+    """
+    crit = dict(combo["criteria"])
+    if level == "STRICT":
+        return crit
+
+    s = _QF_LEVEL_SETTINGS[level]
+    combo_type = combo.get("combo_type", "trend_following")
+    body_min_o = float(crit["body_min"])
+    body_max_o = float(crit["body_max"])
+    vol_min_o  = float(crit["vol_min"])
+    vol_max_o  = float(crit["vol_max"])
+
+    # Body widening — asymmetric for trend, symmetric for CT
+    if combo_type == "trend_following":
+        if body_max_o <= _QF_BODY_DEAD_ZONE_MIN + 1e-9:
+            crit["body_min"] = max(_QF_BODY_FLOOR_TREND, body_min_o - s["body_pad"])
+            crit["body_max"] = min(body_max_o, _QF_BODY_DEAD_ZONE_MIN)
+        elif body_min_o >= _QF_BODY_DEAD_ZONE_MAX - 1e-9:
+            crit["body_min"] = max(body_min_o, _QF_BODY_DEAD_ZONE_MAX)
+            crit["body_max"] = min(_QF_BODY_CEIL, body_max_o + s["body_pad"])
+        else:
+            # Combo straddles dead zone — shouldn't happen with current set
+            crit["body_min"] = max(_QF_BODY_FLOOR_TREND, body_min_o - s["body_pad"])
+            crit["body_max"] = min(_QF_BODY_CEIL, body_max_o + s["body_pad"])
+    else:
+        crit["body_min"] = max(_QF_BODY_FLOOR_CT, body_min_o - s["body_pad"])
+        crit["body_max"] = min(_QF_BODY_CEIL,    body_max_o + s["body_pad"])
+
+    # Volume widening — symmetric, with floor
+    crit["vol_min"] = max(_QF_VOL_FLOOR, vol_min_o - s["vol_pad_min"])
+    crit["vol_max"] = vol_max_o + s["vol_pad_max"]
+
+    # ADX widening — TREND ONLY (countertrend leaves its 0-999 range alone)
+    if combo_type == "trend_following":
+        crit["adx_min"] = max(_QF_ADX_FLOOR, float(crit["adx_min"]) - s["adx_pad"])
+        crit["adx_max"] = min(_QF_ADX_CEIL,  float(crit["adx_max"]) + s["adx_pad"])
+
+    return crit
+
+
+def _qf_is_regime_aligned(direction: str, btc_regime: str) -> bool:
+    """Helper: trade direction aligned with BTC regime?"""
+    if btc_regime == "BULL":
+        return direction == "long"
+    if btc_regime == "BEAR":
+        return direction == "short"
+    return False  # CHOP / UNKNOWN: aligned combos can't classify
+
+
+def _qf_signal_matches_at_level(sig: dict, combo: dict, btc_regime: str,
+                                  level: str) -> bool:
+    """Per-level matcher: does sig match combo's (level-widened) criteria?"""
+    crit = _qf_widen_criteria(combo, level)
+    combo_type = combo.get("combo_type", "trend_following")
+
+    tf_norm = (sig.get("timeframe", "") or "").lower()
+    if tf_norm not in combo["tf_eligible"]:
+        return False
+
+    sig_dir = sig.get("direction", "")
+    if combo_type == "countertrend":
+        if sig_dir != crit.get("signal_direction_required", ""):
+            return False
+    else:
+        if sig_dir not in crit["directions"]:
+            return False
+
     try:
-        import inspect as _inspect_qf
-        _gmc_params = _inspect_qf.signature(_qfcombos.get_matching_combos).parameters
-        _QFCOMBOS_HAS_LEVELS = (
-            "allowed_levels" in _gmc_params
-            and hasattr(_qfcombos, "LEVELS")
-            and hasattr(_qfcombos, "LEVEL_SETTINGS")
-            and hasattr(_qfcombos, "classify_signal_level")
+        body_abs = abs(float(sig.get("body_pct", 0)))
+        vol_mult = float(sig.get("vol_mult", 0))
+        adx      = float(sig.get("adx", 0))
+    except (TypeError, ValueError):
+        return False
+    if not (crit["body_min"] <= body_abs   < crit["body_max"]):  return False
+    if not (crit["vol_min"]  <= vol_mult   < crit["vol_max"]):   return False
+    if not (crit["adx_min"]  <= adx        < crit["adx_max"]):   return False
+
+    if crit["regime_mode"] == "A":
+        if btc_regime is None: return False
+        if not _qf_is_regime_aligned(sig["direction"], btc_regime): return False
+    return True
+
+
+def _qf_classify_signal_level(sig: dict, combo: dict, btc_regime: str = None,
+                                allowed_levels: tuple = ("STRICT",)):
+    """Walk levels strictest-first → first match in allowed_levels, or None."""
+    for lvl in _QF_LEVELS:
+        if lvl not in allowed_levels:
+            continue
+        if _qf_signal_matches_at_level(sig, combo, btc_regime, lvl):
+            return lvl
+    return None
+
+
+def _qf_get_matching_combos(sig: dict, enabled_combos: list,
+                              btc_regime: str = None,
+                              allowed_levels: tuple = ("STRICT",)) -> list:
+    """
+    Local replacement for _qfcombos.get_matching_combos with full level support.
+    Reads COMBOS data from quantflow_combos.py but does ALL classification here.
+    """
+    if not _QFCOMBOS_OK or _qfcombos is None:
+        return []
+    matches = []
+    for combo in _qfcombos.COMBOS:
+        if combo["name"] not in enabled_combos:
+            continue
+        lvl = _qf_classify_signal_level(sig, combo, btc_regime, allowed_levels)
+        if lvl is None:
+            continue
+        mc = dict(combo)   # shallow copy, don't mutate the source
+        mc["_matched_level"] = lvl
+        mc["_size_factor"]   = _QF_LEVEL_SETTINGS[lvl]["size_factor"]
+        mc["_pf_haircut"]    = _QF_LEVEL_SETTINGS[lvl]["pf_haircut"]
+        matches.append(mc)
+    _level_rank = {"STRICT": 0, "RELAXED": 1, "LOOSE": 2}
+    matches.sort(key=lambda c: (c["tier"],
+                                _level_rank.get(c.get("_matched_level"), 9)))
+    return matches
+
+
+def _qf_level_badge_html(level: str) -> str:
+    """Confidence-level badge HTML — green/yellow/orange by level."""
+    if level == "STRICT":
+        bg, fg = "#1a4731", "#34d399"
+        title = ("Audit-validated criteria — full sizing, expected PF "
+                 "matches the combo's stated rollup PF")
+    elif level == "RELAXED":
+        bg, fg = "#3f3a16", "#fbbf24"
+        title = ("Slightly widened criteria — sizing 75% of stated, "
+                 "expected PF ~92% of stated rollup PF")
+    elif level == "LOOSE":
+        bg, fg = "#3f1d1d", "#fb923c"
+        title = ("Wider criteria — sizing 50% of stated, expected PF "
+                 "~80% of stated rollup PF. Use sparingly, paper-trade first.")
+    else:
+        bg, fg = "#22272e", "#ccd6f6"
+        title  = ""
+    return (f'<span title="{title}" style="display:inline-block;'
+            f'background:{bg};color:{fg};padding:2px 8px;border-radius:10px;'
+            f'font-size:11px;font-weight:700;letter-spacing:0.5px;">{level}</span>')
+
+
+def _qf_effective_size_pct(sizing: str, size_factor: float) -> float:
+    """Effective % risk after applying level size_factor to base sizing."""
+    base_pct = {"LARGE": 0.75, "FULL": 0.50,
+                "HALF": 0.25, "SMALL": 0.15}.get(sizing, 0.50)
+    return base_pct * float(size_factor)
+
+
+def _qf_render_level_summary_html(matches: list) -> str:
+    """
+    Small banner shown ABOVE the combo panel for non-STRICT matches.
+    Belt-and-suspenders: if the deployed quantflow_combos.py.render_combo_panel_html
+    is an old version that doesn't display level badges, this banner ensures
+    the user still sees the match level + effective sizing/PF haircut.
+    Returns "" for STRICT matches (no banner needed; default state).
+    """
+    if not matches:
+        return ""
+    primary = matches[0]
+    level = primary.get("_matched_level", "STRICT")
+    if level == "STRICT":
+        return ""
+    size_factor = float(primary.get("_size_factor", 1.0))
+    pf_haircut  = float(primary.get("_pf_haircut", 1.0))
+    sizing      = primary.get("primary", {}).get("sizing", "FULL")
+    eff_pct     = _qf_effective_size_pct(sizing, size_factor)
+    rollup_pf   = float(primary.get("rollup", {}).get("pf", 0.0))
+    expected_pf = rollup_pf * pf_haircut
+    badge       = _qf_level_badge_html(level)
+    tone_color  = "#fbbf24" if level == "RELAXED" else "#fb923c"
+    return (
+        f'<div style="margin:8px 0 4px 0;padding:8px 12px;'
+        f'background:rgba(251,146,60,0.08);'
+        f'border-left:3px solid {tone_color};border-radius:4px;'
+        f'font-size:12px;color:#ccd6f6;">'
+        f'<b style="color:{tone_color};">⚙ Match level:</b> {badge} · '
+        f'effective risk <b>{eff_pct:.2f}%</b> '
+        f'(sizing {sizing} × {size_factor:.2f}) · '
+        f'expected PF <b>~{expected_pf:.2f}</b> '
+        f'(audit {rollup_pf:.2f} × {pf_haircut:.2f})'
+        f'</div>'
+    )
+
+
+def _qf_format_ai_level_appendix(matches: list) -> str:
+    """
+    Return a LEVEL section to append to the AI prompt block when matches
+    contain non-STRICT levels. Used as a fallback when the imported
+    build_ai_prompt_block doesn't include level info (old version deployed).
+    Empty string if all matches are STRICT (no append needed).
+    """
+    if not matches:
+        return ""
+    non_strict = [m for m in matches
+                  if m.get("_matched_level") and m["_matched_level"] != "STRICT"]
+    if not non_strict:
+        return ""
+    lines = ["", "=== CONFIDENCE LEVEL CONTEXT ==="]
+    for m in non_strict:
+        lvl = m["_matched_level"]
+        sf  = float(m.get("_size_factor", 1.0))
+        h   = float(m.get("_pf_haircut", 1.0))
+        rollup_pf = float(m.get("rollup", {}).get("pf", 0))
+        exp_pf = rollup_pf * h
+        lines.append(
+            f"  {m['name']} matched at LEVEL: {lvl} — signal is OUTSIDE the "
+            f"strict audit band but inside safe regions. Recommended sizing "
+            f"is {sf:.2f}× of stated; expected PF after haircut ≈ {exp_pf:.2f} "
+            f"(audit {rollup_pf:.2f} × {h:.2f}). Treat with appropriate "
+            f"caution and prefer STRICT matches if multiple are available."
         )
-    except Exception:
-        _QFCOMBOS_HAS_LEVELS = False
+    lines.append("=== END CONFIDENCE LEVEL CONTEXT ===")
+    return "\n".join(lines)
+
 
 # ─── sklearn (optional — falls back to heuristic if missing) ──────────────────
 try:
@@ -2563,23 +2833,29 @@ def _scanner_ai_verdict(sig: dict, ml_a: dict = None, ml_b: dict = None,
                 _qf_btc_regime = (sig.get("_qf_btc_regime")
                                    or _scanner_btc_regime_for_combos())
                 _all_combo_names = [c["name"] for c in _qfcombos.COMBOS]
-                # Defensive: pass allowed_levels only if the deployed combos
-                # module actually accepts it (capability flag set at import).
-                if _QFCOMBOS_HAS_LEVELS:
-                    _qf_matches_for_ai = _qfcombos.get_matching_combos(
-                        sig, _all_combo_names, btc_regime=_qf_btc_regime,
-                        allowed_levels=_qf_allowed_levels,
-                    )
-                else:
-                    _qf_matches_for_ai = _qfcombos.get_matching_combos(
-                        sig, _all_combo_names, btc_regime=_qf_btc_regime,
-                    )
+                # Use the LOCAL level-aware classifier — does not depend on
+                # quantflow_combos.py's API surface.
+                _qf_matches_for_ai = _qf_get_matching_combos(
+                    sig, _all_combo_names, btc_regime=_qf_btc_regime,
+                    allowed_levels=_qf_allowed_levels,
+                )
             except Exception:
                 _qf_matches_for_ai = []
         if _qf_matches_for_ai:
-            _qf_audit_section = _qfcombos.build_ai_prompt_block(
-                _qf_matches_for_ai, sig
-            )
+            # Build the audit section. Try the imported function first; if it
+            # raises (old/incompatible signature) or omits level info (older
+            # version), fall back to a local appendix that surfaces the level
+            # context to the AI.
+            try:
+                _qf_audit_section = _qfcombos.build_ai_prompt_block(
+                    _qf_matches_for_ai, sig
+                )
+            except Exception:
+                _qf_audit_section = ""
+            # Append level context if the imported block doesn't already
+            # mention it (old version detection by string match).
+            if "LEVEL:" not in (_qf_audit_section or "") and "Match level" not in (_qf_audit_section or ""):
+                _qf_audit_section = (_qf_audit_section or "") + _qf_format_ai_level_appendix(_qf_matches_for_ai)
         else:
             # No combo match. Build a context-aware fallback that names the
             # CURRENT allowed levels, so the AI knows whether STRICT-only was
@@ -4911,21 +5187,12 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
             f"({len(_qfcombos.COMBOS)} combos: Tier 1/2 trend + Tier 3 countertrend)",
             expanded=False,
         ):
-            # Hard guard: if combos module is out of date (no level support),
-            # show a loud error instead of crashing later. Most common cause:
-            # user updated app.py on Streamlit Cloud but didn't re-upload the
-            # quantflow_combos.py file alongside it.
-            if not _QFCOMBOS_HAS_LEVELS:
-                st.error(
-                    "⚠️ **quantflow_combos.py is out of date.** The new "
-                    "STRICT/RELAXED/LOOSE confidence-level system requires "
-                    "the updated `quantflow_combos.py` module. "
-                    "Re-upload BOTH `app.py` AND `quantflow_combos.py` from "
-                    "the Apr 29 build to your deploy target. "
-                    "Falling back to legacy STRICT-only behavior for now."
-                )
-                # Don't render the radio; just keep _allowed_levels at default
-                # so downstream code degrades gracefully.
+            # NOTE: Earlier builds had a capability check that warned "out of
+            # date" when quantflow_combos.py didn't expose the level API.
+            # That check produced false positives on stale .pyc cache and
+            # partial deploys. Replaced with a fully bundled level system
+            # (defined at top of this file) — quantflow_combos.py only
+            # needs to provide the COMBOS data, which is stable.
 
             st.markdown(
                 f'<div style="background:#0d1f2d;border:1px solid #58a6ff;'
@@ -4946,40 +5213,38 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                 unsafe_allow_html=True,
             )
 
-            # ── Confidence-level radio (Apr 29, 2026) ──────────────────────
-            # Only rendered when the combos module actually supports levels.
-            # Without the capability flag, we skip the radio and stay on
-            # STRICT-only — preserving legacy behavior.
-            if _QFCOMBOS_HAS_LEVELS:
-                _level_choice = st.radio(
-                    "Confidence level",
-                    options=[
-                        "STRICT only (audit-validated, full sizing)",
-                        "STRICT + RELAXED (small boundary widening, 75% sizing)",
-                        "STRICT + RELAXED + LOOSE (more setups, 50% sizing)",
-                    ],
-                    index=0,
-                    horizontal=False,
-                    key="mscanner_level_scope",
-                    help=(
-                        "STRICT = audit-validated criteria, full sizing, expected PF "
-                        "matches the combo's stated rollup PF.\n"
-                        "RELAXED = signal one-pad outside the strict band but inside "
-                        "safe regions (no 0.60-0.70 dead zone for trend, no ADX > 50, "
-                        "no CT body < 0.78). Sized at 0.75× and expected to deliver "
-                        "~92% of strict PF.\n"
-                        "LOOSE = wider widening (sized 0.50×, ~80% PF). Use sparingly "
-                        "and paper-trade first.\n\n"
-                        "Hard caps: body 0.60-0.70 dead zone, ADX > 50 cap, "
-                        "CT body 0.78 floor — enforced at ALL levels."
-                    ),
-                )
-                if _level_choice.startswith("STRICT only"):
-                    _allowed_levels = ("STRICT",)
-                elif _level_choice.startswith("STRICT + RELAXED ("):
-                    _allowed_levels = ("STRICT", "RELAXED")
-                else:
-                    _allowed_levels = ("STRICT", "RELAXED", "LOOSE")
+            # ── Confidence-level radio ────────────────────────────────────
+            # Always available now. The level system is bundled into app.py
+            # so no version compatibility check is needed.
+            _level_choice = st.radio(
+                "Confidence level",
+                options=[
+                    "STRICT only (audit-validated, full sizing)",
+                    "STRICT + RELAXED (small boundary widening, 75% sizing)",
+                    "STRICT + RELAXED + LOOSE (more setups, 50% sizing)",
+                ],
+                index=0,
+                horizontal=False,
+                key="mscanner_level_scope",
+                help=(
+                    "STRICT = audit-validated criteria, full sizing, expected PF "
+                    "matches the combo's stated rollup PF.\n"
+                    "RELAXED = signal one-pad outside the strict band but inside "
+                    "safe regions (no 0.60-0.70 dead zone for trend, no ADX > 50, "
+                    "no CT body < 0.78). Sized at 0.75× and expected to deliver "
+                    "~92% of strict PF.\n"
+                    "LOOSE = wider widening (sized 0.50×, ~80% PF). Use sparingly "
+                    "and paper-trade first.\n\n"
+                    "Hard caps: body 0.60-0.70 dead zone, ADX > 50 cap, "
+                    "CT body 0.78 floor — enforced at ALL levels."
+                ),
+            )
+            if _level_choice.startswith("STRICT only"):
+                _allowed_levels = ("STRICT",)
+            elif _level_choice.startswith("STRICT + RELAXED ("):
+                _allowed_levels = ("STRICT", "RELAXED")
+            else:
+                _allowed_levels = ("STRICT", "RELAXED", "LOOSE")
 
             cb_cols = st.columns(1)
 
@@ -5318,24 +5583,16 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
     if _QFCOMBOS_OK:
         _filtered_with_matches = []
         for s in all_signals_deduped:
-            # Pass the user-selected confidence-level scope to the classifier
-            # so RELAXED/LOOSE matches surface when the user opted in. Default
-            # `_allowed_levels` is ("STRICT",) which preserves legacy behavior.
-            # If the deployed quantflow_combos.py is stale (no level support),
-            # call the legacy 3-arg form so we don't crash. The user already
-            # saw a loud warning in the combo expander — no need to spam here.
+            # Use the LOCAL level-aware classifier (_qf_get_matching_combos),
+            # which is bundled at the top of this file and uses _qfcombos.COMBOS
+            # purely as a data source. This means: regardless of what version
+            # of quantflow_combos.py is deployed, the level system here works.
             if enabled_combos:
-                if _QFCOMBOS_HAS_LEVELS:
-                    matches = _qfcombos.get_matching_combos(
-                        s, enabled_combos,
-                        btc_regime=_btc_regime_for_combos,
-                        allowed_levels=_allowed_levels,
-                    )
-                else:
-                    matches = _qfcombos.get_matching_combos(
-                        s, enabled_combos,
-                        btc_regime=_btc_regime_for_combos,
-                    )
+                matches = _qf_get_matching_combos(
+                    s, enabled_combos,
+                    btc_regime=_btc_regime_for_combos,
+                    allowed_levels=_allowed_levels,
+                )
             else:
                 matches = []
             s["_qf_matches"]   = matches
@@ -5616,11 +5873,35 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                 if _QFCOMBOS_OK:
                     _qf_matches_card = sig.get("_qf_matches") or []
                     if _qf_matches_card:
-                        _qf_panel_html = _qfcombos.render_combo_panel_html(
-                            _qf_matches_card, sig
-                        )
-                        if _qf_panel_html:
-                            st.markdown(_qf_panel_html, unsafe_allow_html=True)
+                        # Level summary banner FIRST — belt-and-suspenders so
+                        # the user sees the level even if the imported
+                        # render_combo_panel_html is from an older version
+                        # of quantflow_combos.py that doesn't display badges.
+                        _level_banner = _qf_render_level_summary_html(_qf_matches_card)
+                        if _level_banner:
+                            st.markdown(_level_banner, unsafe_allow_html=True)
+                        # Imported panel render. Wrap in try/except — if the
+                        # imported render is incompatible with the level
+                        # metadata we attach, fall through gracefully (the
+                        # banner above already conveyed the level info).
+                        try:
+                            _qf_panel_html = _qfcombos.render_combo_panel_html(
+                                _qf_matches_card, sig
+                            )
+                            if _qf_panel_html:
+                                st.markdown(_qf_panel_html, unsafe_allow_html=True)
+                        except Exception:
+                            # Render failed (incompatible old version of
+                            # quantflow_combos.py). The level banner above
+                            # already showed the essentials; show a short
+                            # combo-name list as fallback so the user still
+                            # sees which combo(s) matched.
+                            _names = ", ".join(
+                                f"{m['name']} (Tier {m.get('tier','?')}, "
+                                f"{m.get('_matched_level','STRICT')})"
+                                for m in _qf_matches_card
+                            )
+                            st.caption(f"Combo matches: {_names}")
 
                 # ── Entry method explanation ──────────────────────────────────
                 # The scanner uses 0% retracement (immediate entry at candle close) as

@@ -2415,6 +2415,9 @@ def _scanner_get_universe_all() -> list:
     Covers ~340 symbols as of Phase 4 (May 2026).
     """
     return _scanner_get_universe(min_volume_usdt=0.0)
+
+
+def _scanner_fetch_candles(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
     """
     Fetch last `limit` klines for symbol/interval from Binance.
     Returns cleaned DataFrame or empty DataFrame on failure.

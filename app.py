@@ -170,6 +170,10 @@ def _qf_signal_matches_at_level(sig: dict, combo: dict, btc_regime: str,
 
     try:
         body_abs = abs(float(sig.get("body_pct", 0)))
+        # body_pct in signal dicts is stored as 0-100 (e.g. 72.3 for 72.3%);
+        # criteria body_min/body_max are in 0-1 scale — normalize before compare.
+        if body_abs > 1.5:
+            body_abs = body_abs / 100.0
         vol_mult = float(sig.get("vol_mult", 0))
         adx      = float(sig.get("adx", 0))
     except (TypeError, ValueError):

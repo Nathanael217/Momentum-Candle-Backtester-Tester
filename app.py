@@ -6529,21 +6529,35 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
             help="Only show signals whose candle body falls in this percentage range.",
         )
     with sc2:
-        vol_range = st.slider(
-            "Volume × range",
-            min_value=1.0, max_value=10.0,
-            value=(1.5, 5.0), step=0.1,
-            key="mscanner_vol_range",
-            help="Only show signals whose volume multiple is in this range.",
+        _vol_no_limit = st.checkbox(
+            "No upper limit",
+            key="mscanner_vol_no_limit",
+            help="When ticked, the volume upper bound is removed (any vol_mult ≥ lower bound passes).",
         )
+        _vol_slider = st.slider(
+            "Volume × range",
+            min_value=1.0, max_value=30.0,
+            value=(1.5, 5.0), step=0.5,
+            key="mscanner_vol_range",
+            help="Volume multiple vs 7-bar average. Max slider is 30×; tick 'No upper limit' to remove the ceiling entirely.",
+            disabled=_vol_no_limit,
+        )
+        vol_range = (_vol_slider[0], 9999.0) if _vol_no_limit else _vol_slider
     with sc3:
-        adx_range = st.slider(
+        _adx_no_limit = st.checkbox(
+            "No upper limit",
+            key="mscanner_adx_no_limit",
+            help="When ticked, the ADX upper bound is removed (any ADX ≥ lower bound passes).",
+        )
+        _adx_slider = st.slider(
             "ADX range",
-            min_value=10, max_value=70,
+            min_value=0, max_value=100,
             value=(20, 60), step=1,
             key="mscanner_adx_range",
-            help="Only show signals whose ADX(14) is in this range.",
+            help="ADX(14) trend strength. Tick 'No upper limit' to remove the ceiling.",
+            disabled=_adx_no_limit,
         )
+        adx_range = (_adx_slider[0], 9999) if _adx_no_limit else _adx_slider
 
     # ── Signal age filter (post-scan — no rescan needed) ───────────────────
     # bar_offset=1 means the most recently closed candle, 2 = one candle ago,

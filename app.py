@@ -7838,7 +7838,27 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                     )
 
                 # ── Build the enhanced trade plan card ─────────────────────────
-                if _etp:
+                # Phase 4b: For unified TIER_3 signals, route to the CT-specialized
+                # 4-zone card (Aggressive / Shallow / Standard CT / Deep) instead
+                # of the trend-tier 4-zone card (Aggressive / Standard / Golden /
+                # Sniper). Tier 1/2 and audited CT1-CT7 keep the inline render below.
+                _primary_match_inline = (sig.get("_qf_matches") or [{}])[0]
+                _is_unified_t3_inline = (
+                    _primary_match_inline.get("_unified_tier") == "TIER_3"
+                    or (_primary_match_inline.get("name") == "TIER_3"
+                        and _primary_match_inline.get("combo_type") == "countertrend")
+                )
+                if _is_unified_t3_inline:
+                    _ct_method_results_inline = sig.get("_bt_method_results") or {}
+                    _ct_card_html = _render_ct_tier3_trade_plan_html(sig, _ct_method_results_inline)
+                    if _ct_card_html:
+                        st.markdown(_ct_card_html, unsafe_allow_html=True)
+                    # Skip the inline trend-tier render below
+                    _skip_inline_trend_render = True
+                else:
+                    _skip_inline_trend_render = False
+
+                if (not _skip_inline_trend_render) and _etp:
                     _sl_pct   = _etp.get("sl_dist_pct", 1.5)
                     _atr_pct  = _etp.get("atr_pct", 0)
                     _dir      = sig["direction"]
@@ -8023,8 +8043,9 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                         f'</div>',
                         unsafe_allow_html=True,
                     )
-                else:
+                elif not _skip_inline_trend_render:
                     # Fallback to old simple display if _trade_plan missing
+                    # (Skipped entirely when Tier 3 CT card was already rendered above.)
                     st.markdown(
                         f'<div style="background:#0d1f2d;border:1px solid #1f6feb;'
                         f'border-radius:6px;padding:10px 14px;margin:8px 0;font-size:13px;">'

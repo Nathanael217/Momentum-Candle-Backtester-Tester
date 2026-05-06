@@ -945,6 +945,36 @@ def _render_decision_matrix_html(
             _pf_s = "∞" if _pf >= 9.9 else f"{_pf:.2f}"
             rows.append(("📊 Backtest", bt_v, _bt_conf, f"PF {_pf_s} · n={_n}"))
 
+    # ── 4b. CT Grid Audit row (Tier 3 unified only) ───────────────────────────
+    _bt_meta_dm = (bt_res or {}).get("meta", {}) or {}
+    _is_unified_t3_dm = _bt_meta_dm.get("ct_unified_tier3", False)
+    if _is_unified_t3_dm and bt_res:
+        _ct_per_method = (bt_res.get("per_method") or {})
+        if _ct_per_method:
+            _ct_best_dm = max(
+                (m for m in _ct_per_method.values() if m.get("n", 0) >= 5),
+                key=lambda m: m.get("ev", -999),
+                default=None,
+            )
+            if _ct_best_dm:
+                ev_dm  = _ct_best_dm.get("ev", 0)
+                wr_dm  = _ct_best_dm.get("win_rate", 0)
+                n_dm   = _ct_best_dm.get("n", 0)
+                if ev_dm >= 0.20:
+                    ct_v = "STRONG"
+                    pass_count += 1
+                elif ev_dm >= 0.05:
+                    ct_v = "DECENT"
+                    pass_count += 1
+                else:
+                    ct_v = "MARGINAL"
+                _ct_conf = "HIGH" if n_dm >= 20 else ("MEDIUM" if n_dm >= 10 else "LOW")
+                _ct_zone = _ct_best_dm.get("zone", "?")
+                rows.append((
+                    "🧮 CT Grid Audit", ct_v, _ct_conf,
+                    f"Best zone: {_ct_zone} · EV {ev_dm:+.3f}R · WR {wr_dm:.0f}%"
+                ))
+
     # ── 5. Macro / regime ─────────────────────────────────────────────────────
     _reg    = sig.get("regime", "")          # GREEN / YELLOW / RED
     _rscore = sig.get("regime_score", 0)
@@ -2911,6 +2941,7 @@ def _scanner_score_signal(
         "regime":        regime_verdict,
         "regime_score":  regime_score_val,
         "body_pct":      round(abs(body_pct) * 100, 1),
+        "body_abs_price": round(abs(body_abs), 8),
         "vol_mult":      round(vol_mult, 2),
         "adx":           round(adx_val,  1),
         "di_plus":       round(di_plus,  1),
@@ -4405,6 +4436,247 @@ def _scanner_quick_backtest(sig: dict) -> dict:
     }
 
 
+# ── Tier 3 CT method grid (Phase 4b May 2026) ────────────────────────────────
+# When the user has unified TIER_3 ticked (synth combo with _unified_tier=
+# "TIER_3"), the CT backtester sweeps a 4x2x3=24 method grid instead of the
+# single primary-plan method used by the audited CT1-CT7 individual combos.
+# This gives the user multiple entry zones to choose from in the card UI.
+#
+# Negative retracement = "let the move extend further before fading":
+#   0.000  → immediate fade at trigger close (Aggressive)
+#   -0.10  → wait for 10% body extension past close (Shallow)
+#   -0.27  → wait for 27% body extension (Standard CT)
+#   -0.618 → wait for 61.8% body extension (Deep / exhaustion)
+#
+# SL methods: ATR (1.5x) tracks volatility; fixed (1.5%) is conservative cap.
+# TP multiples: 2R / 2.5R / 3R let user pick risk:reward profile.
+_CT_TIER3_ZONES = [
+    {"name": "Aggressive",  "retrace":  0.000, "expiry_bars": 0,
+     "desc": "Immediate fade at trigger close. Highest fill rate, lowest R:R."},
+    {"name": "Shallow",     "retrace": -0.100, "expiry_bars": 3,
+     "desc": "Wait for 10% body extension. Slightly better entry."},
+    {"name": "Standard CT", "retrace": -0.270, "expiry_bars": 3,
+     "desc": "Wait for 27% extension. Balanced fill rate vs. R:R."},
+    {"name": "Deep",        "retrace": -0.618, "expiry_bars": 4,
+     "desc": "Wait for 61.8% exhaustion. Best entry but lowest fill rate."},
+]
+_CT_TIER3_SL_METHODS = ["atr_1.5x", "fixed_1.5pct"]   # 2 methods
+_CT_TIER3_TP_MULTS   = [2.0, 2.5, 3.0]                 # 3 multiples
+
+
+def _ct_simulate_zone(df, qualifying_bars: list, zone_cfg: dict,
+                      sl_method: str, tp_R: float,
+                      signal_dir_resolver,
+                      fixed_sl_pct: float, atr_mult: float, max_hold: int) -> tuple:
+    """
+    Simulate ONE (zone × SL × TP) variant across all qualifying CT trigger bars.
+
+    Args:
+        df: OHLCV DataFrame with body_pct, vol_mult, atr14 columns.
+        qualifying_bars: list of bar indices that passed body/vol/floor filters.
+        zone_cfg: dict from _CT_TIER3_ZONES (has 'name', 'retrace', 'expiry_bars').
+        sl_method: 'atr_1.5x' or 'fixed_1.5pct'.
+        tp_R: take-profit multiple (e.g. 2.0).
+        signal_dir_resolver: None for unified TIER_3 (resolve trade dir from candle),
+                             or "short"/"long" for individual CT combos.
+        fixed_sl_pct: SL distance for 'fixed_1.5pct' (typically 0.015).
+        atr_mult: ATR multiplier for 'atr_1.5x' (typically 1.5).
+        max_hold: bars to hold before time-stop.
+
+    Returns:
+        (trades_raw, n_filled, n_expired): list of trade dicts and counts.
+    """
+    import math
+    entry_ret = float(zone_cfg["retrace"])
+    expiry    = int(zone_cfg["expiry_bars"])
+    n_df      = len(df)
+    trades    = []
+    n_filled  = 0
+    n_expired = 0
+
+    for i in qualifying_bars:
+        bar      = df.iloc[i]
+        body_pct = float(bar.get("body_pct", 0) or 0)
+        is_bull  = body_pct > 0
+
+        # Resolve trade direction.
+        # For unified TIER_3 (signal_dir_resolver=None), trade is OPPOSITE of candle.
+        # For CT1-CT7, signal_dir_resolver is a string; this helper isn't called for those.
+        trade_dir = "short" if is_bull else "long"
+
+        close_v  = float(bar["close"])
+        open_v   = float(bar.get("open", close_v))
+        body_abs = abs(close_v - open_v)
+        atr14    = float(bar.get("atr14", close_v * 0.02) or close_v * 0.02)
+        if close_v <= 0 or body_abs <= 0:
+            continue
+
+        # Entry target — negative retrace pushes entry FURTHER in candle direction
+        if trade_dir == "long":
+            # Fading bear candle: wait for further drop, enter long below close
+            entry_target = round(close_v + body_abs * entry_ret, 8)   # entry_ret<0 → below close
+            entry_target = max(entry_target, close_v * 0.85)          # floor at -15%
+        else:
+            # Fading bull candle: wait for further rise, enter short above close
+            entry_target = round(close_v - body_abs * entry_ret, 8)   # -entry_ret>0 → above close
+            entry_target = min(entry_target, close_v * 1.15)          # cap at +15%
+
+        # Walk forward to find fill (or expire)
+        fill_idx = None
+        if entry_ret == 0.0:
+            # Immediate fill at next bar open
+            if i + 1 >= n_df:
+                continue
+            fill_idx    = i + 1
+            entry_price = float(df.iloc[i + 1]["open"])
+        else:
+            # Limit-style: walk forward up to expiry bars looking for touch
+            fill_horizon = min(i + 1 + expiry, n_df - 1)
+            for j in range(i + 1, fill_horizon + 1):
+                bar_j = df.iloc[j]
+                bj_h = float(bar_j["high"])
+                bj_l = float(bar_j["low"])
+                if bj_l <= entry_target <= bj_h:
+                    fill_idx    = j
+                    entry_price = entry_target
+                    break
+            if fill_idx is None:
+                n_expired += 1
+                continue
+
+        if entry_price <= 0:
+            continue
+
+        # Compute SL based on method
+        if sl_method == "atr_1.5x":
+            risk = atr14 * atr_mult
+        else:   # fixed_1.5pct
+            risk = entry_price * fixed_sl_pct
+        if risk <= 0:
+            continue
+
+        if trade_dir == "long":
+            sl = entry_price - risk
+            tp = entry_price + risk * tp_R
+        else:
+            sl = entry_price + risk
+            tp = entry_price - risk * tp_R
+
+        # Walk forward for exit
+        last_idx   = min(fill_idx + max_hold, n_df - 1)
+        outcome    = "TIMEOUT"
+        exit_idx   = last_idx
+        exit_price = float(df.iloc[last_idx]["close"])
+
+        for k in range(fill_idx + 1, last_idx + 1):
+            barK = df.iloc[k]
+            kh = float(barK["high"])
+            kl = float(barK["low"])
+            if trade_dir == "long":
+                tp_hit = kh >= tp
+                sl_hit = kl <= sl
+            else:
+                tp_hit = kl <= tp
+                sl_hit = kh >= sl
+            if tp_hit and sl_hit:
+                outcome    = "SL"
+                exit_idx   = k
+                exit_price = sl
+                break
+            elif tp_hit:
+                outcome    = "TP"
+                exit_idx   = k
+                exit_price = tp
+                break
+            elif sl_hit:
+                outcome    = "SL"
+                exit_idx   = k
+                exit_price = sl
+                break
+
+        if outcome == "TP":
+            realized_r = tp_R
+        elif outcome == "SL":
+            realized_r = -1.0
+        else:
+            if trade_dir == "long":
+                realized_r = (exit_price - entry_price) / risk
+            else:
+                realized_r = (entry_price - exit_price) / risk
+
+        trades.append({
+            "trigger_idx": i,
+            "fill_idx":    fill_idx,
+            "exit_idx":    exit_idx,
+            "bars_held":   exit_idx - fill_idx,
+            "entry":       entry_price,
+            "sl":          sl,
+            "tp":          tp,
+            "exit_price":  exit_price,
+            "outcome":     outcome,
+            "realized_r":  realized_r,
+            "trade_dir":   trade_dir,
+        })
+        n_filled += 1
+
+    return trades, n_filled, n_expired
+
+
+def _ct_compute_method_stats(trades: list, n_filled: int, n_expired: int,
+                             n_qualifying: int, zone_name: str, sl_label: str,
+                             tp_mult: float) -> dict:
+    """
+    Aggregate one method's trades into the same dict shape that
+    _scanner_quick_backtest's method_results uses, so all downstream rendering
+    (zone_best, WFO, ML, card) works without modification.
+
+    Required keys for trend-tier compatibility: zone, sl_label, mgmt, tp_mult,
+    n, win_rate, ev, pf, ev_weighted, wr_weighted, avg_r, avg_bars, buckets,
+    newest_bucket, n_qualifying, n_filled, n_expired, fill_rate, insufficient.
+    """
+    if not trades:
+        return {
+            "zone": zone_name, "sl_label": sl_label, "mgmt": "Simple",
+            "tp_mult": tp_mult, "n": 0, "win_rate": 0.0, "ev": 0.0, "pf": 0.0,
+            "ev_weighted": 0.0, "wr_weighted": 0.0, "avg_r": 0.0, "avg_bars": 0,
+            "insufficient": True, "buckets": [],
+            "newest_bucket": {"n": 0, "wr": 0.0, "ev": 0.0},
+            "n_qualifying": n_qualifying, "n_filled": n_filled,
+            "n_expired": n_expired,
+            "fill_rate": (n_filled / n_qualifying) if n_qualifying > 0 else 0.0,
+        }
+
+    rs       = [t["realized_r"] for t in trades]
+    wins     = [r for r in rs if r > 0]
+    losses   = [r for r in rs if r <= 0]
+    sum_w    = sum(wins)
+    sum_l    = abs(sum(losses))
+    pf       = (sum_w / sum_l) if sum_l > 0 else (float("inf") if sum_w > 0 else 0.0)
+    avg_r    = sum(rs) / len(rs)
+    avg_bars = sum(t["bars_held"] for t in trades) / len(trades)
+    win_rate = 100.0 * len(wins) / len(trades)
+
+    return {
+        "zone": zone_name, "sl_label": sl_label, "mgmt": "Simple",
+        "tp_mult": tp_mult,
+        "n": len(trades),
+        "win_rate": round(win_rate, 2),
+        "ev": round(avg_r, 4),
+        "pf": round(pf, 3) if pf != float("inf") else 999.0,
+        "ev_weighted": round(avg_r, 4),    # no regime weighting for CT for now
+        "wr_weighted": round(win_rate, 2),
+        "avg_r": round(avg_r, 4),
+        "avg_bars": round(avg_bars, 2),
+        "insufficient": len(trades) < 5,
+        "buckets": [],                       # not computed for CT grid
+        "newest_bucket": {"n": len(trades), "wr": round(win_rate, 2), "ev": round(avg_r, 4)},
+        "n_qualifying": n_qualifying,
+        "n_filled": n_filled,
+        "n_expired": n_expired,
+        "fill_rate": (n_filled / n_qualifying) if n_qualifying > 0 else 0.0,
+    }
+
+
 def _scanner_countertrend_quick_backtest(sig: dict, combo: dict) -> dict:
     """
     Per-coin countertrend backtest — mirrors _scanner_quick_backtest's return shape
@@ -4491,159 +4763,289 @@ def _scanner_countertrend_quick_backtest(sig: dict, combo: dict) -> dict:
     n_df = len(df)
     _method_key = f"CT {combo['name']} / {sl_method} / Simple / TP{tp_R:.1f}R"
 
+    # ── Tier 3 unified path: sweep 24-method grid ─────────────────────────────
+    _is_unified_tier3 = (combo.get("_unified_tier") == "TIER_3")
+
+    if _is_unified_tier3:
+        # Build the method-results dict in the same shape as the trend tier's
+        # method_results (used by zone_best computation, WFO, ML, card render).
+        method_results = {}
+        _all_qualifying_count = 0   # qualifying triggers (filter passers, before fill check)
+
+        # Pre-pass: find all qualifying trigger bars ONCE so we can re-use them
+        # across the 24 method variants. This is a major optimization — avoids
+        # 24x duplicate filter passes.
+        qualifying_bars = []
+        for i in range(14, n_df - 2):
+            bar        = df.iloc[i]
+            body_pct_v = float(bar.get("body_pct", 0) or 0)
+            vol_mult_v = float(bar.get("vol_mult",  0) or 0)
+            is_bull    = body_pct_v > 0
+            # signal_dir filter — for unified TIER_3 with signal_dir=None, accept both
+            if signal_dir == "short" and is_bull:     continue
+            if signal_dir == "long"  and not is_bull: continue
+            # signal_dir is None for unified TIER_3 — both directions pass
+            body_abs_frac = abs(body_pct_v)
+            if not (body_min <= body_abs_frac < body_max):  continue
+            if not (vol_min  <= vol_mult_v   < vol_max):    continue
+            # Hard CT body floor (matches level system)
+            if body_abs_frac < 0.78:  continue
+            qualifying_bars.append(i)
+
+        _all_qualifying_count = len(qualifying_bars)
+
+        # Sweep the grid
+        for zone_cfg in _CT_TIER3_ZONES:
+            for sl_method_iter in _CT_TIER3_SL_METHODS:
+                for tp_R_iter in _CT_TIER3_TP_MULTS:
+                    _zone_trades, _zone_filled, _zone_expired = _ct_simulate_zone(
+                        df, qualifying_bars,
+                        zone_cfg=zone_cfg,
+                        sl_method=sl_method_iter,
+                        tp_R=tp_R_iter,
+                        signal_dir_resolver=signal_dir,    # may be None for TIER_3
+                        fixed_sl_pct=FIXED_SL,
+                        atr_mult=ATR_MULT,
+                        max_hold=MAX_HOLD,
+                    )
+                    # Build method key matching trend-tier convention
+                    _method_key_iter = (
+                        f"CT TIER_3 / {zone_cfg['name']} / {sl_method_iter} "
+                        f"/ Simple / TP{tp_R_iter:.1f}R"
+                    )
+                    method_results[_method_key_iter] = _ct_compute_method_stats(
+                        _zone_trades, _zone_filled, _zone_expired, _all_qualifying_count,
+                        zone_name=zone_cfg["name"], sl_label=sl_method_iter,
+                        tp_mult=tp_R_iter,
+                    )
+
+        # Skip the original single-method loop
+        trades_raw    = []   # zone_best computation reads from method_results, not trades_raw
+        _n_qualifying = _all_qualifying_count
+        _n_filled     = sum(m.get("n", 0) for m in method_results.values()) // max(
+            len(_CT_TIER3_SL_METHODS) * len(_CT_TIER3_TP_MULTS), 1)
+        _n_expired    = _n_qualifying * 4 - _n_filled    # 4 zones, rough
+
+    else:
+        # ── ORIGINAL single-method CT path (CT1-CT7) — unchanged ──────────────
+        method_results = {}   # keep the existing trades_raw loop below populating this
+
     # ── Simulate single-method CT trades ──────────────────────────────────────
     # Unlike trend-following's 72-method grid, CT combos specify one validated
     # primary plan. We simulate exactly that plan.
-    trades_raw    = []
-    _n_qualifying = 0
-    _n_filled     = 0
-    _n_expired    = 0
+    # NOTE: this block is ONLY executed when _is_unified_tier3 is False.
+    if not _is_unified_tier3:
+        trades_raw    = []
+        _n_qualifying = 0
+        _n_filled     = 0
+        _n_expired    = 0
 
-    for i in range(14, n_df - 2):
-        bar      = df.iloc[i]
-        body_pct = float(bar.get("body_pct", 0) or 0)   # fraction 0-1 from df
-        vol_mult = float(bar.get("vol_mult",  0) or 0)
-        is_bull  = body_pct > 0
+        for i in range(14, n_df - 2):
+            bar      = df.iloc[i]
+            body_pct = float(bar.get("body_pct", 0) or 0)   # fraction 0-1 from df
+            vol_mult = float(bar.get("vol_mult",  0) or 0)
+            is_bull  = body_pct > 0
 
-        # signal_dir filter: "short" → scanner flagged a BEAR candle; "long" → BULL
-        if signal_dir == "short" and is_bull:      continue
-        if signal_dir == "long"  and not is_bull:  continue
+            # signal_dir filter: "short" → scanner flagged a BEAR candle; "long" → BULL
+            if signal_dir == "short" and is_bull:      continue
+            if signal_dir == "long"  and not is_bull:  continue
 
-        # Body band (fraction, matches df body_pct units and combo criteria units)
-        body_abs_frac = abs(body_pct)
-        if not (body_min <= body_abs_frac < body_max):  continue
+            # Body band (fraction, matches df body_pct units and combo criteria units)
+            body_abs_frac = abs(body_pct)
+            if not (body_min <= body_abs_frac < body_max):  continue
 
-        # Vol band
-        if not (vol_min <= vol_mult < vol_max):  continue
+            # Vol band
+            if not (vol_min <= vol_mult < vol_max):  continue
 
-        _n_qualifying += 1
+            _n_qualifying += 1
 
-        close_v  = float(bar["close"])
-        open_v   = float(bar.get("open", close_v))
-        body_abs = abs(close_v - open_v)     # candle body in price units
-        atr14    = float(bar.get("atr14", close_v * 0.02) or close_v * 0.02)
-        bar_low  = float(bar.get("low",  close_v))
-        bar_high = float(bar.get("high", close_v))
-        if close_v <= 0:
-            continue
+            close_v  = float(bar["close"])
+            open_v   = float(bar.get("open", close_v))
+            body_abs = abs(close_v - open_v)     # candle body in price units
+            atr14    = float(bar.get("atr14", close_v * 0.02) or close_v * 0.02)
+            bar_low  = float(bar.get("low",  close_v))
+            bar_high = float(bar.get("high", close_v))
+            if close_v <= 0:
+                continue
 
-        # ── Entry target ──────────────────────────────────────────────────────
-        # entry_ret is negative → wick AGAINST the signal candle's direction.
-        # "Signal candle direction" is the SCANNER's candle (bear for CT1-4, bull for CT5-7).
-        # LONG  (fading bear): bounce UP from close → entry = close - entry_ret * body_abs
-        #   entry_ret < 0 → -entry_ret > 0 → entry ABOVE close (wait for bounce up).
-        # SHORT (fading bull): pullback DOWN from close → entry = close + entry_ret * body_abs
-        #   entry_ret < 0 → adds a negative → entry BELOW close (wait for pullback down).
-        # entry_ret == 0 → immediate fill at close (both directions).
-        if trade_dir == "long":
-            # -entry_ret is positive when entry_ret<0 → entry above close (bounce up)
-            entry_target = round(close_v - body_abs * entry_ret, 8)
-            entry_target = min(entry_target, close_v * 1.15)    # sanity cap: max 15% above close
-        else:
-            # entry_ret is negative → close + negative → entry below close (pullback down)
-            entry_target = round(close_v + body_abs * entry_ret, 8)
-            entry_target = max(entry_target, close_v * 0.85)    # sanity floor: max 15% below close
-
-        # ── Stop loss ─────────────────────────────────────────────────────────
-        if sl_method == "wick_anchor":
+            # ── Entry target ──────────────────────────────────────────────────────
+            # entry_ret is negative → wick AGAINST the signal candle's direction.
+            # "Signal candle direction" is the SCANNER's candle (bear for CT1-4, bull for CT5-7).
+            # LONG  (fading bear): bounce UP from close → entry = close - entry_ret * body_abs
+            #   entry_ret < 0 → -entry_ret > 0 → entry ABOVE close (wait for bounce up).
+            # SHORT (fading bull): pullback DOWN from close → entry = close + entry_ret * body_abs
+            #   entry_ret < 0 → adds a negative → entry BELOW close (wait for pullback down).
+            # entry_ret == 0 → immediate fill at close (both directions).
             if trade_dir == "long":
-                # SL just below the bear candle's wick low
-                sl_px = round(bar_low * (1 - 0.001), 8)
+                # -entry_ret is positive when entry_ret<0 → entry above close (bounce up)
+                entry_target = round(close_v - body_abs * entry_ret, 8)
+                entry_target = min(entry_target, close_v * 1.15)    # sanity cap: max 15% above close
             else:
-                # SL just above the bull candle's wick high
-                sl_px = round(bar_high * (1 + 0.001), 8)
-        elif sl_method == "atr_1.5x":
-            if trade_dir == "long":
-                sl_px = round(entry_target - ATR_MULT * atr14, 8)
-                sl_px = max(sl_px, entry_target * (1 - 0.06))   # clamp: max 6% SL
-            else:
-                sl_px = round(entry_target + ATR_MULT * atr14, 8)
-                sl_px = min(sl_px, entry_target * (1 + 0.06))
-        else:
-            # fixed_1.5pct — matches FIXED_SL constant above
-            if trade_dir == "long":
-                sl_px = round(entry_target * (1 - FIXED_SL), 8)
-            else:
-                sl_px = round(entry_target * (1 + FIXED_SL), 8)
+                # entry_ret is negative → close + negative → entry below close (pullback down)
+                entry_target = round(close_v + body_abs * entry_ret, 8)
+                entry_target = max(entry_target, close_v * 0.85)    # sanity floor: max 15% below close
 
-        risk_amt = abs(entry_target - sl_px)
-        # Skip degenerate SL (>15% risk, or zero, or directionally inverted)
-        if risk_amt <= 0 or risk_amt / entry_target > 0.15:
-            continue
-        if trade_dir == "long"  and entry_target <= sl_px:  continue
-        if trade_dir == "short" and entry_target >= sl_px:  continue
-
-        if trade_dir == "long":
-            tp_px = round(entry_target + tp_R * risk_amt, 8)
-        else:
-            tp_px = round(entry_target - tp_R * risk_amt, 8)
-
-        # ── Fill logic ────────────────────────────────────────────────────────
-        # entry_ret == 0 → immediate fill at trigger bar close.
-        # entry_ret != 0 → wait up to EXPIRY_BARS for the wick to touch entry.
-        immediate    = (abs(entry_ret) < 1e-9)
-        entry_filled = immediate
-        entry_fill_bar = i if immediate else None
-        EXPIRY_BARS  = 0 if immediate else 3    # mirrors Standard zone expiry
-        result       = "OPEN"
-        bars_held    = 0
-        r_mult       = 0.0
-        j            = i    # ensure j is defined for label_end_bar after inner loop
-
-        for j in range(i + 1, min(i + 1 + MAX_HOLD + EXPIRY_BARS + 1, n_df)):
-            fb = df.iloc[j]
-            hi = float(fb["high"])
-            lo = float(fb["low"])
-
-            if not entry_filled:
-                # LONG: entry is ABOVE close (bounce up) → filled when hi touches it
-                # SHORT: entry is BELOW close (pullback down) → filled when lo touches it
-                fill_cond = (hi >= entry_target if trade_dir == "long"
-                             else lo <= entry_target)
-                if fill_cond:
-                    entry_filled   = True
-                    entry_fill_bar = j
+            # ── Stop loss ─────────────────────────────────────────────────────────
+            if sl_method == "wick_anchor":
+                if trade_dir == "long":
+                    # SL just below the bear candle's wick low
+                    sl_px = round(bar_low * (1 - 0.001), 8)
                 else:
-                    if EXPIRY_BARS > 0 and (j - i) >= EXPIRY_BARS:
-                        result = "EXPIRED"; break
-                    continue
+                    # SL just above the bull candle's wick high
+                    sl_px = round(bar_high * (1 + 0.001), 8)
+            elif sl_method == "atr_1.5x":
+                if trade_dir == "long":
+                    sl_px = round(entry_target - ATR_MULT * atr14, 8)
+                    sl_px = max(sl_px, entry_target * (1 - 0.06))   # clamp: max 6% SL
+                else:
+                    sl_px = round(entry_target + ATR_MULT * atr14, 8)
+                    sl_px = min(sl_px, entry_target * (1 + 0.06))
+            else:
+                # fixed_1.5pct — matches FIXED_SL constant above
+                if trade_dir == "long":
+                    sl_px = round(entry_target * (1 - FIXED_SL), 8)
+                else:
+                    sl_px = round(entry_target * (1 + FIXED_SL), 8)
 
-            bars_held = j - entry_fill_bar
+            risk_amt = abs(entry_target - sl_px)
+            # Skip degenerate SL (>15% risk, or zero, or directionally inverted)
+            if risk_amt <= 0 or risk_amt / entry_target > 0.15:
+                continue
+            if trade_dir == "long"  and entry_target <= sl_px:  continue
+            if trade_dir == "short" and entry_target >= sl_px:  continue
 
-            if bars_held >= MAX_HOLD:
-                ep     = float(fb.get("close", entry_target))
-                r_mult = ((ep - entry_target) / risk_amt if trade_dir == "long"
-                          else (entry_target - ep) / risk_amt) - 0.002
-                result = "WIN" if r_mult > 0 else "LOSS"; break
+            if trade_dir == "long":
+                tp_px = round(entry_target + tp_R * risk_amt, 8)
+            else:
+                tp_px = round(entry_target - tp_R * risk_amt, 8)
 
-            # SL hit
-            sl_hit = (lo <= sl_px if trade_dir == "long" else hi >= sl_px)
-            if sl_hit:
-                r_mult = ((sl_px - entry_target) / risk_amt if trade_dir == "long"
-                          else (entry_target - sl_px) / risk_amt) - 0.002
-                result = "WIN" if r_mult > 0 else "LOSS"; break
+            # ── Fill logic ────────────────────────────────────────────────────────
+            # entry_ret == 0 → immediate fill at trigger bar close.
+            # entry_ret != 0 → wait up to EXPIRY_BARS for the wick to touch entry.
+            immediate    = (abs(entry_ret) < 1e-9)
+            entry_filled = immediate
+            entry_fill_bar = i if immediate else None
+            EXPIRY_BARS  = 0 if immediate else 3    # mirrors Standard zone expiry
+            result       = "OPEN"
+            bars_held    = 0
+            r_mult       = 0.0
+            j            = i    # ensure j is defined for label_end_bar after inner loop
 
-            # TP hit
-            tp_hit = (hi >= tp_px if trade_dir == "long" else lo <= tp_px)
-            if tp_hit:
-                r_mult = tp_R - 0.002
-                result = "WIN"; break
+            for j in range(i + 1, min(i + 1 + MAX_HOLD + EXPIRY_BARS + 1, n_df)):
+                fb = df.iloc[j]
+                hi = float(fb["high"])
+                lo = float(fb["low"])
 
-        if result in ("WIN", "LOSS"):
-            _n_filled += 1
-            trades_raw.append({
-                "result":        result,
-                "r_mult":        r_mult,
-                "bars_held":     bars_held,
-                "bar_index":     i,
-                "label_end_bar": j,
-                "direction":     trade_dir,    # CT trade direction (opposite of signal)
-                "outcome_class": _classify_outcome(r_mult),
-            })
-        elif result == "EXPIRED":
-            _n_expired += 1
+                if not entry_filled:
+                    # LONG: entry is ABOVE close (bounce up) → filled when hi touches it
+                    # SHORT: entry is BELOW close (pullback down) → filled when lo touches it
+                    fill_cond = (hi >= entry_target if trade_dir == "long"
+                                 else lo <= entry_target)
+                    if fill_cond:
+                        entry_filled   = True
+                        entry_fill_bar = j
+                    else:
+                        if EXPIRY_BARS > 0 and (j - i) >= EXPIRY_BARS:
+                            result = "EXPIRED"; break
+                        continue
+
+                bars_held = j - entry_fill_bar
+
+                if bars_held >= MAX_HOLD:
+                    ep     = float(fb.get("close", entry_target))
+                    r_mult = ((ep - entry_target) / risk_amt if trade_dir == "long"
+                              else (entry_target - ep) / risk_amt) - 0.002
+                    result = "WIN" if r_mult > 0 else "LOSS"; break
+
+                # SL hit
+                sl_hit = (lo <= sl_px if trade_dir == "long" else hi >= sl_px)
+                if sl_hit:
+                    r_mult = ((sl_px - entry_target) / risk_amt if trade_dir == "long"
+                              else (entry_target - sl_px) / risk_amt) - 0.002
+                    result = "WIN" if r_mult > 0 else "LOSS"; break
+
+                # TP hit
+                tp_hit = (hi >= tp_px if trade_dir == "long" else lo <= tp_px)
+                if tp_hit:
+                    r_mult = tp_R - 0.002
+                    result = "WIN"; break
+
+            if result in ("WIN", "LOSS"):
+                _n_filled += 1
+                trades_raw.append({
+                    "result":        result,
+                    "r_mult":        r_mult,
+                    "bars_held":     bars_held,
+                    "bar_index":     i,
+                    "label_end_bar": j,
+                    "direction":     trade_dir,    # CT trade direction (opposite of signal)
+                    "outcome_class": _classify_outcome(r_mult),
+                })
+            elif result == "EXPIRED":
+                _n_expired += 1
 
     # ── Aggregate stats ────────────────────────────────────────────────────────
+    # ── TIER_3 early return: method_results already fully populated ─────────
+    if _is_unified_tier3:
+        _decay_buckets  = _compute_decay_buckets(n_df)
+        _current_regime = float(sig.get("regime_score", 50) or 50)
+        _meta_t3 = {
+            "bars_requested": deep_limit, "bars_used": n_df,
+            "bars_coverage": (
+                f"{df.index[0].strftime('%Y-%m-%d')} → "
+                f"{df.index[-1].strftime('%Y-%m-%d')}"
+            ),
+            "bucket_count":   _decay_buckets["count"],
+            "bucket_weights": _decay_buckets["weights"],
+            "bucket_labels":  _decay_buckets["labels"],
+            "filter_ratio":   None,
+            "filter_min_body": body_min,
+            "filter_min_vol":  vol_min,
+            "regime_weighted": False,
+            "current_regime_score": _current_regime,
+            "ct_combo":    combo["name"],
+            "ct_trade_dir": "both",    # TIER_3 accepts both candle directions
+            "ct_unified_tier3": True,
+        }
+        # Derive a synthetic "best" entry from the highest-EV method (n >= 5)
+        _t3_best = max(
+            (m for m in method_results.values() if m.get("n", 0) >= 5),
+            key=lambda m: m.get("ev", -999),
+            default=list(method_results.values())[0] if method_results else {},
+        )
+        _t3_total_n = sum(m.get("n", 0) for m in method_results.values())
+        return {
+            "n":             _t3_total_n,
+            "wr":            round(_t3_best.get("win_rate", 0), 1),
+            "mean_r":        round(_t3_best.get("ev", 0), 3),
+            "pf":            round(_t3_best.get("pf", 0), 3),
+            "sample_trades": [],
+            "win_2r":   round(_t3_best.get("win_rate", 0), 1),
+            "win_3r":   round(_t3_best.get("win_rate", 0), 1),
+            "ev_2r":    round(_t3_best.get("ev", 0), 3),
+            "ev_3r":    round(_t3_best.get("ev", 0), 3),
+            "avg_bars": round(_t3_best.get("avg_bars", 0), 1),
+            "error":    None if _t3_total_n >= 3 else "Insufficient TIER_3 triggers",
+            "per_method":  method_results,
+            "zone_best":   {z["name"]: max(
+                (m for m in method_results.values()
+                 if m.get("zone") == z["name"] and m.get("n", 0) >= 3),
+                key=lambda m: m.get("ev", -999),
+                default={"zone": z["name"], "insufficient": True, "n": 0,
+                         "win_rate": 0, "ev": 0, "pf": 0, "ev_weighted": 0,
+                         "wr_weighted": 0, "avg_r": 0, "avg_bars": 0,
+                         "sl_label": "atr_1.5x", "mgmt": "Simple", "tp_mult": 2.0,
+                         "buckets": [], "newest_bucket": {"n": 0, "wr": 0, "ev": 0},
+                         "n_qualifying": _n_qualifying, "n_filled": 0,
+                         "n_expired": 0, "fill_rate": 0.0},
+            ) for z in _CT_TIER3_ZONES},
+            "best_key":    f"CT TIER_3 / {_t3_best.get('zone','?')} / {_t3_best.get('sl_label','?')} / Simple / TP{_t3_best.get('tp_mult',2.0):.1f}R",
+            "best":        _t3_best,
+            "meta":        _meta_t3,
+            "candidate_newest":   None,
+            "candidate_weighted": None,
+        }
+
     _fill_rate = (
         round(_n_filled / _n_qualifying * 100, 1) if _n_qualifying > 0 else 0.0
     )
@@ -10432,7 +10834,175 @@ def _render_enhanced_trade_plan_html(sig: dict) -> str:
     )
 
 
-def _render_method_breakdown_table(bt_result: dict) -> str:
+def _render_ct_tier3_trade_plan_html(sig: dict, ct_method_results: dict) -> str:
+    """
+    CT-specialized Enhanced Trade Plan card for unified TIER_3 signals.
+    Replaces the trend-tier 4-zone card (Aggressive/Standard/Golden/Sniper)
+    with 4 CT zones (Aggressive/Shallow/Standard CT/Deep) using NEGATIVE
+    retracements that wait for the move to extend before fading.
+
+    Args:
+        sig: signal dict with body_pct, candle close, etc.
+        ct_method_results: method_results dict from _scanner_countertrend_quick_backtest
+                           when run with unified TIER_3 (24-method grid).
+                           May be empty/None — falls back to predicted entries only.
+
+    Returns:
+        HTML string ready for st.markdown(unsafe_allow_html=True).
+    """
+    direction = sig.get("direction", "short")    # this is the TRADE direction
+    # body_pct may be percent or fraction — auto-normalize
+    body_raw = abs(float(sig.get("body_pct", 0) or 0))
+    body_abs_frac = body_raw / 100.0 if body_raw > 1.5 else body_raw
+    close_v   = float(sig.get("close", 0) or 0)
+    if close_v <= 0:
+        return ""
+
+    # Body in price units: use sig['body_abs_price'] if present,
+    # else estimate from close × body_abs_frac × candle_range_pct (default 2%).
+    body_price = float(sig.get("body_abs_price", 0) or 0)
+    if body_price <= 0:
+        # Estimate: assume candle range is ~2% of close, body fills body_abs_frac
+        body_price = close_v * 0.02 * body_abs_frac
+        if body_price <= 0:
+            body_price = close_v * 0.005
+
+    # Entry math — entry_ret negative means wait for extension
+    def _entry_for(retrace: float) -> float:
+        if direction == "long":   # fading short candle, entry below close
+            entry = close_v + body_price * retrace    # retrace<0 → entry below
+            return max(entry, close_v * 0.85)
+        else:                      # fading long candle, entry above close
+            entry = close_v - body_price * retrace    # -retrace>0 → entry above
+            return min(entry, close_v * 1.15)
+
+    # Find best per-zone method from ct_method_results (if provided)
+    def _best_for_zone(zone_name: str) -> dict:
+        if not ct_method_results:
+            return {}
+        best = None
+        for k, m in ct_method_results.items():
+            if m.get("zone") != zone_name:
+                continue
+            if m.get("n", 0) < 3:
+                continue
+            if best is None or m.get("ev", 0) > best.get("ev", -999):
+                best = m
+        return best or {}
+
+    # Map zone_cfg names to the 4-zone display
+    zones = [
+        {"name": "Aggressive",  "retrace":  0.000,
+         "color_bg": "#091a1a", "color_border": "#1a4a3a", "color_accent": "#3fb950",
+         "label_html": "💥 Aggressive Entry (0%)",
+         "desc": "Immediate fade at trigger close. Highest fill rate, lowest R:R."},
+        {"name": "Shallow",     "retrace": -0.100,
+         "color_bg": "#0d1726", "color_border": "#1f3a5a", "color_accent": "#58a6ff",
+         "label_html": "🌊 Shallow Wait (-10%)",
+         "desc": "Wait for 10% body extension past close, then fade."},
+        {"name": "Standard CT", "retrace": -0.270,
+         "color_bg": "#1a1530", "color_border": "#3a2a5a", "color_accent": "#a78bfa",
+         "label_html": "🎯 Standard CT (-27%)",
+         "desc": "Wait for 27% extension. Balanced fill rate vs entry quality."},
+        {"name": "Deep",        "retrace": -0.618,
+         "color_bg": "#2a1015", "color_border": "#5a2a35", "color_accent": "#f97583",
+         "label_html": "🪨 Deep Exhaustion (-61.8%)",
+         "desc": "Wait for 61.8% exhaustion. Best entry, lowest fill rate."},
+    ]
+
+    def _fmt(v): return f"{v:.6g}" if v else "—"
+
+    zone_blocks = []
+    for z in zones:
+        entry_p = _entry_for(z["retrace"])
+        best    = _best_for_zone(z["name"])
+        # SL/TP from primary plan (use audit-best method per zone if available)
+        sl_label = best.get("sl_label", "atr_1.5x")
+        tp_R     = float(best.get("tp_mult", 2.0))
+        # Approximate SL/TP prices from entry
+        if sl_label == "fixed_1.5pct":
+            risk = entry_p * 0.015
+        else:
+            risk = entry_p * 0.02   # rough ATR proxy without df access here
+        if direction == "long":
+            sl = entry_p - risk
+            tp_2  = entry_p + risk * 2.0
+            tp_25 = entry_p + risk * 2.5
+            tp_3  = entry_p + risk * 3.0
+        else:
+            sl = entry_p + risk
+            tp_2  = entry_p - risk * 2.0
+            tp_25 = entry_p - risk * 2.5
+            tp_3  = entry_p - risk * 3.0
+
+        # Audit stats
+        if best:
+            stats_html = (
+                f'<div style="color:#8892b0;font-size:10px;margin-top:6px;">'
+                f'AUDIT (n={best.get("n", 0)}): '
+                f'WR <b style="color:#3fb950">{best.get("win_rate", 0):.0f}%</b> · '
+                f'EV <b style="color:#3fb950">{best.get("ev", 0):+.3f}R</b> · '
+                f'PF <b style="color:#3fb950">{best.get("pf", 0):.2f}</b>'
+                f'</div>'
+            )
+        else:
+            stats_html = (
+                '<div style="color:#8892b0;font-size:10px;margin-top:6px;font-style:italic;">'
+                'AUDIT: no historical fills (zone may rarely trigger on this coin)'
+                '</div>'
+            )
+
+        block = (
+            f'<div style="background:{z["color_bg"]};border:1px solid {z["color_border"]};'
+            f'border-radius:6px;padding:10px;">'
+            f'<div style="color:{z["color_accent"]};font-size:10px;text-transform:uppercase;'
+            f'letter-spacing:1px;margin-bottom:6px;font-weight:700;">{z["label_html"]}</div>'
+            f'<div style="color:#aab;font-size:10px;margin-bottom:8px;">{z["desc"]}</div>'
+            f'<div style="color:#8892b0;font-size:10px;">ENTRY</div>'
+            f'<div style="color:#ccd6f6;font-weight:700;font-size:13px;">{_fmt(entry_p)}</div>'
+            f'<div style="color:#8892b0;font-size:10px;margin-top:5px;">STOP LOSS ({sl_label})</div>'
+            f'<div style="color:#f97583;font-weight:700;font-size:13px;">{_fmt(sl)}</div>'
+            f'<div style="color:#8892b0;font-size:10px;margin-top:5px;">TP1 / TP2 / TP3</div>'
+            f'<div style="color:#3fb950;font-weight:700;font-size:12px;">'
+            f'{_fmt(tp_2)} / {_fmt(tp_25)} / {_fmt(tp_3)}</div>'
+            f'{stats_html}'
+            f'</div>'
+        )
+        zone_blocks.append(block)
+
+    # CT-specific freshness note
+    bar_off = sig.get("bar_offset", 1)
+    is_fresh = bar_off == 1
+    if is_fresh:
+        freshness = (
+            "<span style='color:#3fb950;font-weight:700;'>🟢 FRESH — exhaustion candle just closed.</span> "
+            "All four CT zones are valid. Negative retracement = wait for further extension before fading."
+        )
+    else:
+        freshness = (
+            f"<span style='color:#e3b341;font-weight:700;'>⚠️ Signal is {bar_off-1} candle(s) old.</span> "
+            "Aggressive zone may have already filled. Shallow / Standard CT / Deep zones still potentially valid."
+        )
+
+    html = (
+        f'<div style="margin:14px 0;padding:14px;background:#0d1f2d;border:2px solid #58a6ff;border-radius:8px;">'
+        f'<div style="color:#58a6ff;font-weight:700;font-size:14px;margin-bottom:6px;">'
+        f'🎯 Tier 3 CT Trade Plan — 4 Entry Zones × 2 SL × 3 TP</div>'
+        f'<div style="color:#ccd6f6;font-size:11px;margin-bottom:10px;line-height:1.5;">{freshness}</div>'
+        f'<div style="display:grid;grid-template-columns:repeat(2, 1fr);gap:10px;margin-bottom:12px;">'
+        + "".join(zone_blocks)
+        + f'</div>'
+        f'<div style="background:#0a1521;border-top:1px solid #1a4a3a;padding:8px 10px;'
+        f'border-radius:4px;font-size:10px;color:#8892b0;line-height:1.6;">'
+        f'<b style="color:#58a6ff;">CT entry semantics:</b> negative retracement = wait for the original '
+        f'move to extend further before fading. '
+        f'<b style="color:#58a6ff;">SL methods tested:</b> atr_1.5x (volatility-tracking) and fixed_1.5pct (conservative cap). '
+        f'<b style="color:#58a6ff;">TP multiples tested:</b> 2R / 2.5R / 3R. '
+        f'Audit stats shown per zone show the best (highest EV) SL/TP combination for that zone.'
+        f'</div>'
+        f'</div>'
+    )
+    return html
     """
     Build the 'Full Method Breakdown' table HTML — all 96 method combinations
     sorted by EVw with the 👑 crown on the best. Used by both Scanner and
@@ -11104,7 +11674,18 @@ def render_manual_analyzer_tab():
     # ── Enhanced Trade Plan card (3 entry zones + management plan) ──────────
     # Same component the Scanner tab uses. Shows Aggressive / Standard / Sniper
     # entries with SL + TP1/2/3, structural zone validity, and the 4 mgmt modes.
-    _etp_html = _render_enhanced_trade_plan_html(sig)
+    # For unified TIER_3 countertrend signals, routes to the CT-specialized card.
+    _primary_match_etp = (sig.get("_qf_matches") or [{}])[0]
+    _is_unified_t3_etp = (
+        _primary_match_etp.get("_unified_tier") == "TIER_3"
+        or (_primary_match_etp.get("name") == "TIER_3"
+            and _primary_match_etp.get("combo_type") == "countertrend")
+    )
+    if _is_unified_t3_etp:
+        _ct_method_results_etp = sig.get("_bt_method_results") or {}
+        _etp_html = _render_ct_tier3_trade_plan_html(sig, _ct_method_results_etp)
+    else:
+        _etp_html = _render_enhanced_trade_plan_html(sig)
     if _etp_html:
         st.markdown(_etp_html, unsafe_allow_html=True)
 

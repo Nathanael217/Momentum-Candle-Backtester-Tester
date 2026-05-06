@@ -5014,6 +5014,79 @@ def _scanner_countertrend_quick_backtest(sig: dict, combo: dict) -> dict:
             default=list(method_results.values())[0] if method_results else {},
         )
         _t3_total_n = sum(m.get("n", 0) for m in method_results.values())
+
+        # ── Build candidates A and B for Step 2 ML and WFO (Phase 4b fix) ────
+        # Without these, _bt_for_pick.get("candidate_newest") is None, ML
+        # training gets "— n/a —" labels, and WFO runs on the bare 'best' dict
+        # without method_cfg metadata. Mirror the trend-tier candidate selection
+        # logic: A = best in newest bucket, B = best by all-time EV. For Tier 3
+        # we don't have time-decay buckets (the grid runs once across all bars),
+        # so "newest_bucket" stats == overall stats and the two candidates may
+        # collapse to the same method — that's OK, the UI handles _ab_same.
+        _t3_candidate_pool = {
+            f"CT_T3_{m['zone']}/{m['sl_label']}/TP{m['tp_mult']}": m
+            for m in method_results.values()
+            if not m.get("insufficient")
+            and m.get("n", 0) >= 5
+            and m.get("win_rate", 0) >= 30
+        }
+        # If strict pool is empty, fall back to relaxed (n>=3) so users still
+        # see candidates instead of "— n/a —" on coins with sparse triggers.
+        if not _t3_candidate_pool:
+            _t3_candidate_pool = {
+                f"CT_T3_{m['zone']}/{m['sl_label']}/TP{m['tp_mult']}": m
+                for m in method_results.values()
+                if m.get("n", 0) >= 3
+            }
+
+        _t3_cand_newest   = None
+        _t3_cand_weighted = None
+        if _t3_candidate_pool:
+            # Candidate A: highest EV (Tier 3 has no bucket weighting, so
+            # ev == ev_weighted == newest_bucket.ev)
+            _key_a = max(_t3_candidate_pool,
+                         key=lambda k: _t3_candidate_pool[k].get("ev", -999))
+            _m_a = _t3_candidate_pool[_key_a]
+            _t3_cand_newest = {
+                **_m_a,
+                "key": _key_a,
+                "method_cfg": {
+                    "zone":     _m_a["zone"],
+                    "sl_label": _m_a["sl_label"],
+                    "mgmt":     _m_a["mgmt"],
+                    "tp_mult":  _m_a["tp_mult"],
+                },
+            }
+            # Candidate B: highest WR among methods with n>=5 (different angle
+            # than EV — favors consistency over magnitude)
+            _key_b = max(_t3_candidate_pool,
+                         key=lambda k: _t3_candidate_pool[k].get("win_rate", -999))
+            _m_b = _t3_candidate_pool[_key_b]
+            _t3_cand_weighted = {
+                **_m_b,
+                "key": _key_b,
+                "method_cfg": {
+                    "zone":     _m_b["zone"],
+                    "sl_label": _m_b["sl_label"],
+                    "mgmt":     _m_b["mgmt"],
+                    "tp_mult":  _m_b["tp_mult"],
+                },
+            }
+
+        # Enrich 'best' with method_cfg too (WFO and AI verdict expect this key)
+        _t3_best_enriched = {
+            **_t3_best,
+            "key": (f"CT_T3_{_t3_best.get('zone','?')}/"
+                    f"{_t3_best.get('sl_label','?')}/"
+                    f"TP{_t3_best.get('tp_mult', 2.0)}"),
+            "method_cfg": {
+                "zone":     _t3_best.get("zone", "Aggressive"),
+                "sl_label": _t3_best.get("sl_label", "atr_1.5x"),
+                "mgmt":     _t3_best.get("mgmt", "Simple"),
+                "tp_mult":  _t3_best.get("tp_mult", 2.0),
+            },
+        } if _t3_best else {}
+
         return {
             "n":             _t3_total_n,
             "wr":            round(_t3_best.get("win_rate", 0), 1),
@@ -5039,11 +5112,11 @@ def _scanner_countertrend_quick_backtest(sig: dict, combo: dict) -> dict:
                          "n_qualifying": _n_qualifying, "n_filled": 0,
                          "n_expired": 0, "fill_rate": 0.0},
             ) for z in _CT_TIER3_ZONES},
-            "best_key":    f"CT TIER_3 / {_t3_best.get('zone','?')} / {_t3_best.get('sl_label','?')} / Simple / TP{_t3_best.get('tp_mult',2.0):.1f}R",
-            "best":        _t3_best,
+            "best_key":    _t3_best_enriched.get("key", f"CT TIER_3 / {_t3_best.get('zone','?')} / {_t3_best.get('sl_label','?')} / Simple / TP{_t3_best.get('tp_mult',2.0):.1f}R"),
+            "best":        _t3_best_enriched if _t3_best_enriched else _t3_best,
             "meta":        _meta_t3,
-            "candidate_newest":   None,
-            "candidate_weighted": None,
+            "candidate_newest":   _t3_cand_newest,
+            "candidate_weighted": _t3_cand_weighted,
         }
 
     _fill_rate = (
@@ -5186,6 +5259,41 @@ def _scanner_mini_wfo(sig: dict, bt_results: dict) -> dict:
             "verdict":     "INSUFFICIENT",
             "method_used": best_key or "—",
             "note":        "Backtest found no valid method (need ≥ 4 trades). WFO cannot run.",
+        }
+
+    # ── Tier 3 unified path: skip trend-style WFO ───────────────────────────
+    # The trend-style WFO walks the entire candle history applying TREND retrace
+    # math (entry = close - body × ret_frac), which is wrong for CT (where
+    # ret_frac is negative and the entry must EXTEND past the candle, not
+    # retrace into it). Plus the trend WFO's _ZONE_CFG dict only knows the
+    # 4 trend zone names — Tier 3 uses Shallow/Standard CT/Deep which fall
+    # through to retrace=0 silently, producing wrong stats. Rather than
+    # silently rendering wrong WFO numbers, return a clean message pointing
+    # the user to the CT Grid Audit row in the Decision Matrix, which DOES
+    # validate Tier 3 across the whole 24-method grid against full history.
+    _wfo_meta = bt_results.get("meta", {}) or {}
+    if _wfo_meta.get("ct_unified_tier3"):
+        _per_method = bt_results.get("per_method") or {}
+        _t3_n_total = sum(m.get("n", 0) for m in _per_method.values())
+        return {
+            "ok":          True,
+            "verdict":     "BORDERLINE" if _t3_n_total >= 30 else "INSUFFICIENT",
+            "method_used": best_key,
+            "is_pf":       float(best.get("pf", 0)),
+            "is_n":        int(best.get("n", 0)),
+            "oos_pf":      float(best.get("pf", 0)),
+            "oos_wr":      float(best.get("win_rate", 0)),
+            "oos_n":       int(best.get("n", 0)),
+            "oos_is_ratio": 1.0,
+            "tier_label":  "TIER_3 — full-history grid (no IS/OOS split)",
+            "note": (
+                f"Tier 3 unified — backtest already evaluates the full 24-method "
+                f"grid against ALL available history ({_t3_n_total} total trades "
+                f"across all 24 zone × SL × TP combinations). Standard IS/OOS "
+                f"split-validation isn't run because each method's per-method n "
+                f"is too small for splitting. See the CT Grid Audit row in the "
+                f"Decision Matrix for the validated best zone."
+            ),
         }
 
     zone_name   = best.get("zone",     "Aggressive")

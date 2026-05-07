@@ -2954,6 +2954,13 @@ def _scanner_score_signal(
         "candle_rank":   round(c_rank,   2),
         "vol_rank":      round(v_rank,   2),
         "close":         close_px,
+        # OHLC + atr stored so downstream consumers (Tier 3 flip path,
+        # CT card, post-scan recompute) can rebuild the trade plan without
+        # going back to the candle dataframe.
+        "open":          open_px,
+        "high":          high_px,
+        "low":           low_px,
+        "atr14":         atr14_val,
         "entry":         entry,
         "sl":            sl,
         "tp2r":          tp2r,
@@ -7583,6 +7590,58 @@ def render_auto_analyzer(ticker: str, df_full_1d: pd.DataFrame, tc: float,
                         matched["_pf_haircut"]    = _QF_LEVEL_SETTINGS[lvl]["pf_haircut"]
                         matched["_similar_to"]    = similar    # may be None
                         s["_qf_matches"]          = [matched]
+
+                        # ── Tier 3 direction flip ─────────────────────────────
+                        # Up to this point sig["direction"] holds the CANDLE
+                        # direction (bullish=long / bearish=short). For TIER_3
+                        # countertrend the trade is the OPPOSITE of the candle
+                        # (fade bull euphoria → SHORT;  fade bear capitulation
+                        # → LONG, and audit shows LONG is the strong side at
+                        # PF 1.33 vs SHORT at marginal 1.08).
+                        #
+                        # We mutate sig in place so EVERY downstream consumer —
+                        # the summary dataframe, the card header, the CT trade
+                        # plan card, the inline render block — sees the trade
+                        # direction, not the candle direction. The original
+                        # candle direction is preserved in _candle_direction
+                        # for any UI element that wants to label "fade-the-
+                        # bull" vs "fade-the-bear" context.
+                        if tier_key == "TIER_3":
+                            _orig_candle_dir = s["direction"]
+                            s["_candle_direction"] = _orig_candle_dir
+                            s["direction"] = (
+                                "short" if _orig_candle_dir == "long" else "long"
+                            )
+                            # Recompute the enhanced trade plan for the
+                            # flipped (trade) direction so entry/SL/TP prices
+                            # in the summary table and any zone display match
+                            # the actual trade. Falls back gracefully if any
+                            # OHLC field is missing on legacy sigs.
+                            try:
+                                _bp_raw = abs(float(s.get("body_pct", 0) or 0))
+                                _bp_frac = (_bp_raw / 100.0) if _bp_raw > 1.5 else _bp_raw
+                                _new_etp = _compute_enhanced_trade_plan(
+                                    direction=s["direction"],
+                                    close_px=float(s.get("close", 0) or 0),
+                                    open_px=float(s.get("open",  s.get("close", 0)) or 0),
+                                    high_px=float(s.get("high",  s.get("close", 0)) or 0),
+                                    low_px=float(s.get("low",   s.get("close", 0)) or 0),
+                                    atr14=float(s.get("atr14",  s.get("close", 0) * 0.02) or 0),
+                                    body_pct=_bp_frac,
+                                )
+                                if _new_etp:
+                                    s["_trade_plan"] = _new_etp
+                                    _close_fb = float(s.get("close", 0) or 0)
+                                    s["entry"] = _new_etp.get("agg_entry", _close_fb)
+                                    s["sl"]    = _new_etp.get("agg_sl",    s["entry"])
+                                    s["tp2r"]  = _new_etp.get("agg_tp2",   s["entry"])
+                                    s["tp3r"]  = _new_etp.get("agg_tp3",   s["entry"])
+                            except Exception:
+                                # If recompute fails, keep flipped direction
+                                # but leave old plan — at least the header
+                                # label is correct.
+                                pass
+
                         _filtered_with_matches.append(s)
                         _tier_matched = True
                         break    # one tier match per signal is enough
